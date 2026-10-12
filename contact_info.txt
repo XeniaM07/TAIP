@@ -10,15 +10,15 @@ Members:
 Coordinator: Stefan Balauca
 
 Responsibilities of the members:
-Persoana 1	
+Aioanei Elena
 - Retrieval & Sources	
 - Metode de căutare, RAG, colectarea surselor și extragerea fragmentelor relevante
 
-Persoana 2
+Lefter Sorin
 - AI Answer Generation
 - Modele LLM, prompt engineering, generarea afirmațiilor și asocierea citărilor
 
-Persoana 3
+Bolohan Constantin-Sebastian
 - Evidence Verification & Evaluation
 - Verificarea afirmațiilor, hallucinations, metrici și metode de evaluare
 
@@ -26,6 +26,6 @@ Zebega George
 - Distributed Systems
 - Arhitectura distribuită, comunicarea dintre servicii și cerințele obligatorii ale disciplinei
 
-Persoana 5
+Mariei Xenia
 - UI & Orchestration
 - Interfața, fluxul aplicației, integrarea modulelor și prezentarea dovezilor
