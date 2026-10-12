@@ -1,0 +1,33 @@
+Project Name: Evidence-backed Verifiable AI Assistant
+
+Responsibilities of the members:
+
+Aioanei Elena
+- Retrieval & Sources	
+- Research and implement information retrieval technique;
+- Investigate Retrieval-Augmented Generation (RAG).
+- Collect relevant sources and extract supporting evidence.
+
+Lefter Sorin
+- AI Answer Generation
+- Investigate and integrate Large Language Models (LLMs).
+- Develop prompt engineering strategies.
+- Generate answers and associate citations with individual claims.
+
+Bolohan Constantin-Sebastian
+- Evidence Verification & Evaluation
+- Investigate methods for verifying AI-generated claims.
+- Research hallucination detection and factual consistency.
+- Define evaluation metrics and assess the reliability of generated answers.
+
+Zebega George
+- Distributed Systems
+- Design the distributed system architecture.
+- Define communication mechanisms between services.
+- Investigate distributed computing requirements and system integration.
+
+Mariei Xenia
+- UI & Orchestration
+- Design and implement the user interface.
+- Define the application's workflow and coordinate module integration.
+- Develop mechanisms for presenting supporting evidence and verification results.
