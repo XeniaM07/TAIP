@@ -7,25 +7,7 @@ Members:
 4. Mariei Xenia: xmariei0705@gmail.com
 5. Zebega Lucian George: georgezgl12@gmail.com
 
-Coordinator: Stefan Balauca
+Coordinator: Stefan Balauca, Astrid Balauca, Adrian Iftene
 
-Responsibilities of the members:
-Aioanei Elena
-- Retrieval & Sources	
-- Metode de căutare, RAG, colectarea surselor și extragerea fragmentelor relevante
-
-Lefter Sorin
-- AI Answer Generation
-- Modele LLM, prompt engineering, generarea afirmațiilor și asocierea citărilor
-
-Bolohan Constantin-Sebastian
-- Evidence Verification & Evaluation
-- Verificarea afirmațiilor, hallucinations, metrici și metode de evaluare
-
-Zebega George
-- Distributed Systems
-- Arhitectura distribuită, comunicarea dintre servicii și cerințele obligatorii ale disciplinei
-
-Mariei Xenia
-- UI & Orchestration
-- Interfața, fluxul aplicației, integrarea modulelor și prezentarea dovezilor
+Github repository: https://github.com/XeniaM07/TAIP
+Trello Board: https://trello.com/b/Ne9wWb8M/taip
