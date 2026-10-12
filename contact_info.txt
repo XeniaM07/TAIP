@@ -1,0 +1,31 @@
+Project Name: Evidence-backed Verifiable AI Assistant
+
+Members:
+1. Aioanei Elena: aioanei.elena@outlook.com
+2. Bolohan Constantin Sebastian: sebastian.bolohan97@gmail.com
+3. Lefter Sorin: sorinl2002@yahoo.com
+4. Mariei Xenia: xmariei0705@gmail.com
+5. Zebega Lucian George: georgezgl12@gmail.com
+
+Coordinator: Stefan Balauca
+
+Responsibilities of the members:
+Persoana 1	
+- Retrieval & Sources	
+- Metode de căutare, RAG, colectarea surselor și extragerea fragmentelor relevante
+
+Persoana 2
+- AI Answer Generation
+- Modele LLM, prompt engineering, generarea afirmațiilor și asocierea citărilor
+
+Persoana 3
+- Evidence Verification & Evaluation
+- Verificarea afirmațiilor, hallucinations, metrici și metode de evaluare
+
+Zebega George
+- Distributed Systems
+- Arhitectura distribuită, comunicarea dintre servicii și cerințele obligatorii ale disciplinei
+
+Persoana 5
+- UI & Orchestration
+- Interfața, fluxul aplicației, integrarea modulelor și prezentarea dovezilor
