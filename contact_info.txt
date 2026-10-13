@@ -11,7 +11,4 @@ Coordinator: Stefan Balauca, Astrid Balauca, Adrian Iftene
 
 Github repository: https://github.com/XeniaM07/TAIP
 Trello Board: https://trello.com/b/Ne9wWb8M/taip
-
-LAB 2:
-State of the art: ttps://docs.google.com/document/d/1HOCupQhdIWhDXAMrIm8qd7F945jw7w0DBUVvehSwbW4/edit?tab=t.0
-Use of AI: https://docs.google.com/document/d/1J8QuuHYjHVotSkBCpx1ANSjmbcll3lXm4iZjT2mSnh0/edit?usp=sharing
+Drive: https://drive.google.com/drive/u/1/folders/1GihLGcg-sAglEYR0BnT8BPXGvL9oPvNO
