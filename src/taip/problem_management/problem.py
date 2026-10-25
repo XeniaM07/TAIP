@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 from taip.common.contracts import Constraint
+from taip.problem_management.memento import ProblemMemento
 
 
 class MathematicalProblem:
-    """Receiver for constraint editing commands."""
+    """Receiver for commands and originator for mementos."""
 
     problem_id: str
     original_prompt: str
@@ -21,4 +22,10 @@ class MathematicalProblem:
         ...
 
     def remove_constraint(self, constraint_id: str) -> None:
+        ...
+
+    def create_memento(self) -> ProblemMemento:
+        ...
+
+    def restore(self, memento: ProblemMemento) -> None:
         ...
