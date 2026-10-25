@@ -1,4 +1,4 @@
-# TAIP — Lab 04
+# TAIP
 
 Structural Python project for the **AI-Assisted Mathematical Problem Solving and Evidence Verification Platform**.
 
