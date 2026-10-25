@@ -8,7 +8,7 @@ Lab 04 requires **class, attribute, method-signature, and relationship declarati
 
 ## Requirements
 
-- Python 3.13+
+- Python 3.12+
 - Git
 
 ## Project layout
