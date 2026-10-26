@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 
+from taip.ai_integration.adapters import AIModelAdapter
+from taip.ai_integration.creators import ModelAdapterCreator
 from taip.common.contracts import (
     ExecutionRun as ExecutionRunContract,
     ModelResponse,
@@ -15,12 +17,34 @@ from taip.orchestration.execution import (
 
 
 class ModelExecutionCoordinator:
-    """Coordinates the three model executions for one shared run."""
+    """Declare execution through canonical AI creator and adapter abstractions.
+
+    The configured creators correspond to the run's three model identifiers.
+    These relationships do not initialize dependencies or validate identities.
+    """
+
+    adapter_creators: tuple[
+        ModelAdapterCreator,
+        ModelAdapterCreator,
+        ModelAdapterCreator,
+    ]
+
+    def create_adapters(
+        self,
+    ) -> tuple[AIModelAdapter, AIModelAdapter, AIModelAdapter]:
+        """Declare three adapter products supplied by the abstract creators."""
+        ...
 
     def execute(
         self,
         execution_run: ExecutionRunContract,
     ) -> tuple[ModelResponse, ModelResponse, ModelResponse]:
+        """Declare shared responses without implementing dispatch.
+
+        Future ModelRequest values reuse execution_run.snapshot and the matching
+        model identifier. Each adapter receives run_id=execution_run.run_id as
+        a keyword argument; correlation enforcement remains future behavior.
+        """
         ...
 
 
