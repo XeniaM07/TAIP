@@ -1,4 +1,3 @@
-
 """Structural tests for the Memento design pattern."""
 
 import unittest
