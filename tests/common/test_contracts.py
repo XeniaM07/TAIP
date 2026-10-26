@@ -30,14 +30,17 @@ class ContractTests(unittest.TestCase):
             self.snapshot.version = 2
 
     def test_shared_snapshot_reused_by_requests_and_run(self) -> None:
-        request = ModelRequest(model_id="m-1", snapshot=self.snapshot)
+        requests = tuple(
+            ModelRequest(model_id=model_id, snapshot=self.snapshot)
+            for model_id in ("m-1", "m-2", "m-3")
+        )
         run = ExecutionRun(
             run_id="run-1",
             snapshot=self.snapshot,
             model_ids=("m-1", "m-2", "m-3"),
             status=ExecutionStatus.PENDING,
         )
-        self.assertIs(request.snapshot, run.snapshot)
+        self.assertTrue(all(request.snapshot is run.snapshot for request in requests))
         self.assertEqual(len(run.model_ids), 3)
 
     def test_verification_status_has_three_outcomes(self) -> None:

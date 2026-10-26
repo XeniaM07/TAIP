@@ -1,8 +1,10 @@
 
 from __future__ import annotations
 
+from taip.ai_integration import AIModelAdapter, ModelAdapterCreator
 from taip.common.contracts import (
     ExecutionRun as ExecutionRunContract,
+    ModelRequest,
     ModelResponse,
     ProblemSnapshot,
     VerificationResult,
@@ -10,6 +12,7 @@ from taip.common.contracts import (
 from taip.orchestration.execution import (
     ExecutionResultCollector,
     ExecutionRunContext,
+    ModelExecution,
     VerificationCoordinator,
 )
 
@@ -17,15 +20,37 @@ from taip.orchestration.execution import (
 class ModelExecutionCoordinator:
     """Coordinates the three model executions for one shared run."""
 
+    adapter_creators: tuple[
+        ModelAdapterCreator,
+        ModelAdapterCreator,
+        ModelAdapterCreator,
+    ]
+
+    def create_adapters(
+        self,
+    ) -> tuple[AIModelAdapter, AIModelAdapter, AIModelAdapter]:
+        ...
+
+    def create_requests(
+        self,
+        execution_run: ExecutionRunContract,
+    ) -> tuple[ModelRequest, ModelRequest, ModelRequest]:
+        ...
+
     def execute(
         self,
         execution_run: ExecutionRunContract,
+        model_adapters: tuple[
+            AIModelAdapter,
+            AIModelAdapter,
+            AIModelAdapter,
+        ],
     ) -> tuple[ModelResponse, ModelResponse, ModelResponse]:
         ...
 
 
 class ProblemOrchestrator:
-    """Orchestrates execution against one confirmed problem snapshot."""
+    """Orchestrates execution against a snapshot produced by confirmation."""
 
     model_execution_coordinator: ModelExecutionCoordinator
 
@@ -52,7 +77,7 @@ class ExecutionFacade:
     def get_results(
         self,
         execution_run: ExecutionRunContext,
-    ) -> list[ModelResponse]:
+    ) -> tuple[ModelExecution, ModelExecution, ModelExecution]:
         ...
 
     def get_verification_results(

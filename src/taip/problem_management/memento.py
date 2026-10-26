@@ -13,5 +13,6 @@ class ProblemMemento:
     """Immutable representation of a captured draft state."""
 
     _problem_id: str
+    _original_prompt: str
     _objective: str
     _constraints: tuple[Constraint, ...]

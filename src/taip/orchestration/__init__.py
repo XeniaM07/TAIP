@@ -15,7 +15,9 @@ from taip.orchestration.facade import (
 from taip.orchestration.states import (
     CompletedState,
     ExecutionState,
+    ExecutionStateContext,
     FailedState,
+    PartialState,
     PendingState,
     RunningState,
 )
@@ -26,9 +28,11 @@ __all__ = [
     "ExecutionResultCollector",
     "ExecutionRunContext",
     "ExecutionState",
+    "ExecutionStateContext",
     "FailedState",
     "ModelExecution",
     "ModelExecutionCoordinator",
+    "PartialState",
     "PendingState",
     "ProblemOrchestrator",
     "RunningState",

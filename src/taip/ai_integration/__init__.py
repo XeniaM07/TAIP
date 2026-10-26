@@ -1,5 +1,28 @@
-"""Lab 04 model adapters, provider-facing interfaces and adapter creators.
+"""Public interfaces for AI model adapters and their creators.
 
-Public declarations live in ``adapters`` and ``creators``. Operational methods
-are intentionally unimplemented; structural tests live in ``testing``.
+Operational methods are intentionally unimplemented for Lab 04.
 """
+
+from taip.ai_integration.adapters import (
+    AIModelAdapter,
+    GeminiAdapter,
+    OpenAIAdapter,
+    ThirdModelAdapter,
+)
+from taip.ai_integration.creators import (
+    GeminiAdapterCreator,
+    ModelAdapterCreator,
+    OpenAIAdapterCreator,
+    ThirdModelAdapterCreator,
+)
+
+__all__ = [
+    "AIModelAdapter",
+    "GeminiAdapter",
+    "GeminiAdapterCreator",
+    "ModelAdapterCreator",
+    "OpenAIAdapter",
+    "OpenAIAdapterCreator",
+    "ThirdModelAdapter",
+    "ThirdModelAdapterCreator",
+]
