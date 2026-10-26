@@ -51,14 +51,3 @@ All production methods remain declarations only. These type relationships repres
 6. Benchmarking remains distinct from verification of a single user problem.
 
 This setup only **represents** these concepts; enforcement is future implementation work.
-
-## AOP
-
-AOP is a cross-cutting concern for the upcoming labs. This structural lab does not select or configure a Python weaving framework, and does not implement advice or pointcuts. Confirm the expected AOP demonstration with the coordinator before choosing a framework.
-
-## Caveats
-
-- `ProblemSnapshot` is a frozen dataclass and its constraints are a tuple of frozen `Constraint` objects. This is a shallow structural immutability design appropriate for the declared fields.
-- `ModelStatus` and `ExecutionStatus` are different because model requests may fail independently.
-- Data fields and provider identities are provisional until agreed by the team.
-- Factory Method requires a creator hierarchy, and Template Method requires an intended shared workflow; merely naming classes does not demonstrate the patterns.
