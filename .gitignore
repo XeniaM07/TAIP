@@ -13,3 +13,5 @@ __pycache__/
 
 # Editor settings
 .vscode/
+
+*.egg-info/
