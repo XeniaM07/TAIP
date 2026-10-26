@@ -40,6 +40,12 @@ On Windows PowerShell, set the import path with `$env:PYTHONPATH = "src"` before
 
 - [Architecture and module ownership](docs/ARCHITECTURE.md)
 - [Contribution rules](CONTRIBUTING.md)
+- [AI model Adapter and Factory Method declarations](docs/diagrams/ai_integration.md)
+- [AI assistance disclosure for AI-01 and AI-02](docs/AI_USAGE_AI_INTEGRATION.md)
+
+The AI module's tests live in `src/taip/ai_integration/testing`. The full-suite
+command above includes them; they can also be run independently with
+`python -m unittest discover -s src/taip/ai_integration/testing -v`.
 
 ## Future work
 
