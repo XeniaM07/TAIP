@@ -7,11 +7,14 @@ from typing import get_type_hints
 from taip.common.contracts import (
     ExecutionRun as ExecutionRunContract,
     ExecutionStatus,
+    ModelRequest,
     ModelResponse,
     ModelStatus,
     ProblemSnapshot,
     VerificationResult,
 )
+from taip.ai_integration import AIModelAdapter, ModelAdapterCreator
+from taip.mathematical_verification import VerificationHandler
 from taip.orchestration.execution import (
     ExecutionResultCollector,
     ExecutionRunContext,
@@ -23,10 +26,12 @@ from taip.orchestration.facade import (
     ModelExecutionCoordinator,
     ProblemOrchestrator,
 )
+from taip.orchestration import ExecutionStateContext
 from taip.orchestration.states import (
     CompletedState,
     ExecutionState,
     FailedState,
+    PartialState,
     PendingState,
     RunningState,
 )
@@ -41,12 +46,18 @@ class OrchestrationStructureTests(unittest.TestCase):
             RunningState,
             CompletedState,
             FailedState,
+            PartialState,
         ):
             with self.subTest(state=state_type.__name__):
                 self.assertTrue(issubclass(state_type, ExecutionState))
                 self.assertFalse(inspect.isabstract(state_type))
                 for method in ("status", "start", "complete", "fail"):
                     self.assertIn(method, state_type.__dict__)
+        self.assertEqual(PendingState.state_status, ExecutionStatus.PENDING)
+        self.assertEqual(RunningState.state_status, ExecutionStatus.RUNNING)
+        self.assertEqual(CompletedState.state_status, ExecutionStatus.COMPLETED)
+        self.assertEqual(FailedState.state_status, ExecutionStatus.FAILED)
+        self.assertEqual(PartialState.state_status, ExecutionStatus.PARTIAL)
 
     def test_state_interface_uses_execution_status_contract(self) -> None:
         self.assertEqual(
@@ -57,8 +68,16 @@ class OrchestrationStructureTests(unittest.TestCase):
             with self.subTest(method=method):
                 self.assertEqual(
                     get_type_hints(getattr(ExecutionState, method)),
-                    {"return": type(None)},
+                    {
+                        "context": ExecutionStateContext,
+                        "return": type(None),
+                    },
                 )
+        self.assertEqual(
+            get_type_hints(ExecutionRunContext.transition_to),
+            {"state": ExecutionState, "return": type(None)},
+        )
+        self.assertIn(ExecutionStateContext, ExecutionRunContext.__bases__)
 
     def test_model_execution_uses_shared_contracts(self) -> None:
         self.assertEqual(
@@ -93,7 +112,7 @@ class OrchestrationStructureTests(unittest.TestCase):
             get_type_hints(ExecutionResultCollector.collect),
             {
                 "execution_run": ExecutionRunContext,
-                "return": list[ModelResponse],
+                "return": tuple[ModelExecution, ModelExecution, ModelExecution],
             },
         )
         self.assertEqual(
@@ -104,12 +123,55 @@ class OrchestrationStructureTests(unittest.TestCase):
                 "return": list[VerificationResult],
             },
         )
+        self.assertEqual(
+            get_type_hints(VerificationCoordinator),
+            {"verification_chain": VerificationHandler},
+        )
 
     def test_facade_components_use_shared_contracts(self) -> None:
+        self.assertEqual(
+            get_type_hints(ModelExecutionCoordinator),
+            {
+                "adapter_creators": tuple[
+                    ModelAdapterCreator,
+                    ModelAdapterCreator,
+                    ModelAdapterCreator,
+                ]
+            },
+        )
+        self.assertEqual(
+            get_type_hints(ModelExecutionCoordinator.create_adapters),
+            {
+                "return": tuple[
+                    AIModelAdapter,
+                    AIModelAdapter,
+                    AIModelAdapter,
+                ]
+            },
+        )
+        self.assertEqual(
+            get_type_hints(ModelExecutionCoordinator.create_requests),
+            {
+                "execution_run": ExecutionRunContract,
+                "return": tuple[ModelRequest, ModelRequest, ModelRequest],
+            },
+        )
+        self.assertEqual(
+            get_type_hints(ExecutionFacade.get_results),
+            {
+                "execution_run": ExecutionRunContext,
+                "return": tuple[ModelExecution, ModelExecution, ModelExecution],
+            },
+        )
         self.assertEqual(
             get_type_hints(ModelExecutionCoordinator.execute),
             {
                 "execution_run": ExecutionRunContract,
+                "model_adapters": tuple[
+                    AIModelAdapter,
+                    AIModelAdapter,
+                    AIModelAdapter,
+                ],
                 "return": tuple[ModelResponse, ModelResponse, ModelResponse],
             },
         )
@@ -133,13 +195,6 @@ class OrchestrationStructureTests(unittest.TestCase):
             {
                 "confirmed_snapshot": ProblemSnapshot,
                 "return": ExecutionRunContext,
-            },
-        )
-        self.assertEqual(
-            get_type_hints(ExecutionFacade.get_results),
-            {
-                "execution_run": ExecutionRunContext,
-                "return": list[ModelResponse],
             },
         )
         self.assertEqual(

@@ -5,10 +5,10 @@ from taip.common.contracts import (
     ExecutionRun as ExecutionRunContract,
     ModelResponse,
     ModelStatus,
-    ProblemSnapshot,
     VerificationResult,
 )
-from taip.orchestration.states import ExecutionState
+from taip.mathematical_verification import VerificationHandler
+from taip.orchestration.states import ExecutionState, ExecutionStateContext
 
 
 class ModelExecution:
@@ -20,7 +20,7 @@ class ModelExecution:
     response: ModelResponse | None
 
 
-class ExecutionRunContext:
+class ExecutionRunContext(ExecutionStateContext):
     """State pattern context for a run using the shared run contract."""
 
     run: ExecutionRunContract
@@ -40,19 +40,24 @@ class ExecutionRunContext:
     def fail(self) -> None:
         ...
 
+    def transition_to(self, state: ExecutionState) -> None:
+        ...
+
 
 class ExecutionResultCollector:
-    """Collects responses from the model executions in a run."""
+    """Collects every model outcome, including failed executions."""
 
     def collect(
         self,
         execution_run: ExecutionRunContext,
-    ) -> list[ModelResponse]:
+    ) -> tuple[ModelExecution, ModelExecution, ModelExecution]:
         ...
 
 
 class VerificationCoordinator:
     """Coordinates mathematical verification of model responses."""
+
+    verification_chain: VerificationHandler
 
     def verify(
         self,

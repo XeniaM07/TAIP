@@ -32,6 +32,8 @@ class Constraint:
 
 @dataclass(frozen=True, slots=True)
 class ProblemSnapshot:
+    """Immutable, confirmed version of a mathematical problem."""
+
     problem_id: str
     version: int
     original_prompt: str
@@ -63,6 +65,8 @@ class VerificationResult:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionRun:
+    """One three-model execution run sharing a single problem snapshot."""
+
     run_id: str
     snapshot: ProblemSnapshot
     model_ids: tuple[str, str, str]
