@@ -1,4 +1,3 @@
-
 """Structural tests for the Command design pattern."""
 
 import inspect

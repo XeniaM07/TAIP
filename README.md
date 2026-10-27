@@ -41,6 +41,7 @@ On Windows PowerShell, set the import path with `$env:PYTHONPATH = "src"` before
 - [Architecture and module ownership](docs/ARCHITECTURE.md)
 - [Contribution rules](CONTRIBUTING.md)
 
+
 ## Future work
 
 FastAPI, mathematical libraries, AI providers, database, and an AOP implementation are future decisions, not part of Lab 04. Confirm the instructor's AOP expectations before choosing a specific mechanism.

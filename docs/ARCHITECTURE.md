@@ -32,6 +32,15 @@ All module owners import shared contracts from `taip.common.contracts`; do **not
 
 Dependencies on concrete classes across module boundaries should be avoided; use public interfaces. If an interface is needed by multiple modules, agree on its home before implementing it.
 
+## Declared integration points
+
+- `MathematicalProblem.confirm(version)` declares the draft-to-confirmed-snapshot boundary. `ProblemVersionHistory` declares storage and retrieval by problem ID and version. `ProblemSnapshot` is immutable; the method declarations do not enforce confirmation or append-only versioning at runtime.
+- `ModelExecutionCoordinator` composes three `ModelAdapterCreator` interfaces and declares adapter/request creation for one `ExecutionRun`. The run contains one shared `ProblemSnapshot`; each `ModelRequest` carries that snapshot.
+- `VerificationHandler` composes its corresponding `VerificationStrategy`. `VerificationCoordinator` depends on the public handler abstraction rather than a concrete handler.
+- `ExecutionRunContext` relates the run to three independent `ModelExecution` records and an `ExecutionState`. The result collector returns those model records so a failed model remains represented. `PartialState` corresponds to `ExecutionStatus.PARTIAL`.
+
+All production methods remain declarations only. These type relationships represent the intended integration; they do not enforce runtime behavior.
+
 ## Core invariants from Lab 03
 
 1. Model execution is authorized only after explicit Save & Confirm.
@@ -42,10 +51,3 @@ Dependencies on concrete classes across module boundaries should be avoided; use
 6. Benchmarking remains distinct from verification of a single user problem.
 
 This setup only **represents** these concepts; enforcement is future implementation work.
-
-## Caveats
-
-- `ProblemSnapshot` is a frozen dataclass and its constraints are a tuple of frozen `Constraint` objects. This is a shallow structural immutability design appropriate for the declared fields.
-- `ModelStatus` and `ExecutionStatus` are different because model requests may fail independently.
-- Data fields and provider identities are provisional until agreed by the team.
-- Factory Method requires a creator hierarchy, and Template Method requires an intended shared workflow; merely naming classes does not demonstrate the patterns.
