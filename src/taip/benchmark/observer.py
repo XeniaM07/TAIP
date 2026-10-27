@@ -1,5 +1,5 @@
 
-"""Observer pattern structure for benchmark notifications."""
+"""Observer pattern for benchmark execution notifications."""
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -18,59 +18,68 @@ class BenchmarkEvent:
 
 
 class BenchmarkObserver(ABC):
-    """Abstract interface for components observing benchmark events."""
+    """Interface implemented by components observing benchmark events."""
 
     @abstractmethod
     def update(self, event: BenchmarkEvent) -> None:
-        """Declare the observer notification method."""
+        """Handle a benchmark event."""
         ...
 
 
 class BenchmarkSubject(ABC):
-    """Abstract interface for managing benchmark observers."""
-
-    observers: list[BenchmarkObserver]
+    """Interface for managing benchmark observers."""
 
     @abstractmethod
     def attach(self, observer: BenchmarkObserver) -> None:
-        """Declare observer registration."""
+        """Register an observer."""
         ...
 
     @abstractmethod
     def detach(self, observer: BenchmarkObserver) -> None:
-        """Declare observer removal."""
+        """Unregister an observer."""
         ...
 
     @abstractmethod
     def notify_observers(self, event: BenchmarkEvent) -> None:
-        """Declare notification of registered observers."""
+        """Notify all registered observers."""
         ...
 
 
 class BenchmarkResultPublisher(BenchmarkSubject):
-    """Publishes benchmark execution events to registered observers."""
+    """Publishes benchmark events to registered observers."""
 
-    observers: list[BenchmarkObserver]
+    def __init__(self) -> None:
+        self.observers: list[BenchmarkObserver] = []
 
     def attach(self, observer: BenchmarkObserver) -> None:
-        ...
+        if observer not in self.observers:
+            self.observers.append(observer)
 
     def detach(self, observer: BenchmarkObserver) -> None:
-        ...
+        if observer in self.observers:
+            self.observers.remove(observer)
 
     def notify_observers(self, event: BenchmarkEvent) -> None:
-        ...
+        for observer in tuple(self.observers):
+            observer.update(event)
 
 
 class BenchmarkResultCollector(BenchmarkObserver):
-    """Observes benchmark events related to results."""
+    """Collects benchmark results received through notifications."""
+
+    def __init__(self) -> None:
+        self.results: list[BenchmarkResult] = []
 
     def update(self, event: BenchmarkEvent) -> None:
-        ...
+        if event.result is not None:
+            self.results.append(event.result)
 
 
 class BenchmarkProgressObserver(BenchmarkObserver):
-    """Observes benchmark execution progress and state changes."""
+    """Records benchmark execution states."""
+
+    def __init__(self) -> None:
+        self.events: list[BenchmarkEvent] = []
 
     def update(self, event: BenchmarkEvent) -> None:
-        ...
+        self.events.append(event)
