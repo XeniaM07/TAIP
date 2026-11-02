@@ -65,15 +65,25 @@ class BenchmarkResultPublisher(BenchmarkSubject):
 
 
 class BenchmarkResultCollector(BenchmarkObserver):
-    """Collects benchmark results received through notifications."""
+    """Collect completed benchmark results exactly once per execution."""
 
     def __init__(self) -> None:
         self.results: list[BenchmarkResult] = []
+        self._collected_execution_ids: set[str] = set()
 
     def update(self, event: BenchmarkEvent) -> None:
-        if event.result is not None:
-            self.results.append(event.result)
+        """Store a completed execution result if not already collected."""
+        if event.state != "completed":
+            return
 
+        if event.result is None:
+            return
+
+        if event.execution_id in self._collected_execution_ids:
+            return
+
+        self.results.append(event.result)
+        self._collected_execution_ids.add(event.execution_id)
 
 class BenchmarkProgressObserver(BenchmarkObserver):
     """Records benchmark execution states."""
