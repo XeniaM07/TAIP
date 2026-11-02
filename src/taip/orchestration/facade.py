@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+from uuid import uuid4
 
 from taip.ai_integration import AIModelAdapter, ModelAdapterCreator
 from taip.common.contracts import (
@@ -9,6 +10,7 @@ from taip.common.contracts import (
     ProblemSnapshot,
     VerificationResult,
     ModelStatus,
+    ExecutionStatus,
 )
 from taip.orchestration.execution import (
     ExecutionResultCollector,
@@ -131,10 +133,54 @@ class ProblemOrchestrator:
     model_execution_coordinator: ModelExecutionCoordinator
 
     def execute(
-        self,
-        confirmed_snapshot: ProblemSnapshot,
+            self,
+            confirmed_snapshot: ProblemSnapshot,
     ) -> ExecutionRunContext:
-        ...
+        """Execute three models against one confirmed snapshot."""
+        if confirmed_snapshot.version < 1:
+            raise ValueError(
+                "A positive confirmed snapshot version is required."
+            )
+
+        if not confirmed_snapshot.problem_id.strip():
+            raise ValueError("Problem identifier cannot be empty.")
+
+        adapters = (
+            self.model_execution_coordinator.create_adapters()
+        )
+
+        model_ids = tuple(
+            adapter.get_model_identifier()
+            for adapter in adapters
+        )
+
+        if len(model_ids) != 3 or len(set(model_ids)) != 3:
+            raise ValueError(
+                "Exactly three distinct models are required."
+            )
+
+        run = ExecutionRunContract(
+            run_id=str(uuid4()),
+            snapshot=confirmed_snapshot,
+            model_ids=model_ids,
+            status=ExecutionStatus.PENDING,
+        )
+
+        context = ExecutionRunContext(run)
+        context.start()
+
+        try:
+            responses = self.model_execution_coordinator.execute(
+                context.run,
+                adapters,
+            )
+            context.record_responses(responses)
+        except Exception:
+            if context.run.status == ExecutionStatus.RUNNING:
+                context.fail()
+            raise
+
+        return context
 
 
 class ExecutionFacade:
@@ -145,19 +191,38 @@ class ExecutionFacade:
     verification_coordinator: VerificationCoordinator
 
     def start_execution(
-        self,
-        confirmed_snapshot: ProblemSnapshot,
+            self,
+            confirmed_snapshot: ProblemSnapshot,
     ) -> ExecutionRunContext:
-        ...
+        """Start a new execution through the problem orchestrator."""
+        return self.problem_orchestrator.execute(
+            confirmed_snapshot
+        )
 
     def get_results(
-        self,
-        execution_run: ExecutionRunContext,
+            self,
+            execution_run: ExecutionRunContext,
     ) -> tuple[ModelExecution, ModelExecution, ModelExecution]:
-        ...
+        """Return all model outcomes, including failed ones."""
+        return self.result_collector.collect(
+            execution_run
+        )
 
     def get_verification_results(
-        self,
-        execution_run: ExecutionRunContext,
+            self,
+            execution_run: ExecutionRunContext,
     ) -> list[VerificationResult]:
-        ...
+        """Verify all available completed responses."""
+        responses = [
+            item.response
+            for item in self.get_results(execution_run)
+            if (
+                    item.response is not None
+                    and item.status == ModelStatus.COMPLETED
+            )
+        ]
+
+        return self.verification_coordinator.verify(
+            execution_run,
+            responses,
+        )
