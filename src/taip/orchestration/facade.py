@@ -27,15 +27,45 @@ class ModelExecutionCoordinator:
     ]
 
     def create_adapters(
-        self,
+            self,
     ) -> tuple[AIModelAdapter, AIModelAdapter, AIModelAdapter]:
-        ...
+        """Create the three configured adapters using Factory Method."""
+        if len(self.adapter_creators) != 3:
+            raise ValueError("Exactly three adapter creators are required.")
+
+        adapters = tuple(
+            creator.create_adapter()
+            for creator in self.adapter_creators
+        )
+
+        model_ids = tuple(
+            adapter.get_model_identifier()
+            for adapter in adapters
+        )
+
+        if len(set(model_ids)) != 3:
+            raise ValueError("Adapter model identifiers must be unique.")
+
+        return adapters
 
     def create_requests(
-        self,
-        execution_run: ExecutionRunContract,
+            self,
+            execution_run: ExecutionRunContract,
     ) -> tuple[ModelRequest, ModelRequest, ModelRequest]:
-        ...
+        """Create one model request per model using the same snapshot."""
+        if len(execution_run.model_ids) != 3:
+            raise ValueError("Exactly three model identifiers are required.")
+
+        if len(set(execution_run.model_ids)) != 3:
+            raise ValueError("Model identifiers must be unique.")
+
+        return tuple(
+            ModelRequest(
+                model_id=model_id,
+                snapshot=execution_run.snapshot,
+            )
+            for model_id in execution_run.model_ids
+        )
 
     def execute(
         self,
