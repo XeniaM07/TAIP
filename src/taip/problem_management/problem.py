@@ -54,8 +54,23 @@ class MathematicalProblem:
     def confirm(self, version: int) -> ProblemSnapshot:
         ...
 
+    
     def create_memento(self) -> ProblemMemento:
-        ...
+        """Capture an immutable copy of the current draft state."""
+        return ProblemMemento(
+            _problem_id=self.problem_id,
+            _original_prompt=self.original_prompt,
+            _objective=self.objective,
+            _constraints=tuple(self.constraints),
+        )
 
     def restore(self, memento: ProblemMemento) -> None:
-        ...
+        """Restore a previously saved draft state."""
+        if memento._problem_id != self.problem_id:
+            raise ValueError(
+                "Cannot restore a memento from another problem."
+            )
+
+        self.original_prompt = memento._original_prompt
+        self.objective = memento._objective
+        self.constraints = list(memento._constraints)
