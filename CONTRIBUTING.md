@@ -5,7 +5,7 @@
 - Class names: `PascalCase`; functions, files and attributes: `snake_case`; constants: `UPPER_SNAKE_CASE`.
 - Use type hints for public methods and attributes.
 - Use `abc.ABC` / `@abstractmethod` or `typing.Protocol` when an interface is needed.
-- Do not implement functional behavior in Lab 04. Use method stubs (`...` / `pass`) where appropriate.
+- Implement functional behavior incrementally using Test Driven Development (TDD). Preserve existing design patterns, shared contracts, and module boundaries.
 - Import contracts from `taip.common.contracts` and do not duplicate definitions.
 - Avoid circular imports and dependencies on provider-specific classes in coordination interfaces.
 
@@ -24,7 +24,7 @@
 3. Shared types match `common/contracts.py`.
 4. `python -m compileall -q src tests` passes.
 5. `PYTHONPATH=src python -m unittest discover -s tests -v` passes (PowerShell: `$env:PYTHONPATH = "src"`).
-6. Functional behavior, provider calls and mathematical algorithms are not introduced.
+6. Functional implementations must be covered by unit tests. Follow the RED → GREEN → REFACTOR cycle and preserve evidence of each iteration.
 
 ## AI usage
 

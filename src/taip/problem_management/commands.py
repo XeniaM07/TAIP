@@ -14,6 +14,7 @@ class ConstraintCommand(ABC):
 
     @abstractmethod
     def execute(self) -> None:
+        """Execute the command."""
         ...
 
 
@@ -24,7 +25,7 @@ class AddConstraintCommand(ConstraintCommand):
     constraint: Constraint
 
     def execute(self) -> None:
-        ...
+        self.problem.add_constraint(self.constraint)
 
 
 class UpdateConstraintCommand(ConstraintCommand):
@@ -34,7 +35,7 @@ class UpdateConstraintCommand(ConstraintCommand):
     constraint: Constraint
 
     def execute(self) -> None:
-        ...
+        self.problem.update_constraint(self.constraint)
 
 
 class RemoveConstraintCommand(ConstraintCommand):
@@ -44,4 +45,4 @@ class RemoveConstraintCommand(ConstraintCommand):
     constraint_id: str
 
     def execute(self) -> None:
-        ...
+        self.problem.remove_constraint(self.constraint_id)

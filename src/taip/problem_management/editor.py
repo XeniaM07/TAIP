@@ -10,4 +10,5 @@ class ProblemEditor:
     """Invoker responsible for dispatching commands."""
 
     def execute_command(self, command: ConstraintCommand) -> None:
-        ...
+        """Execute the supplied constraint command."""
+        command.execute()
