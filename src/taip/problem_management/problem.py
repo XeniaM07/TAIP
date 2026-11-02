@@ -51,8 +51,33 @@ class MathematicalProblem:
             f"Constraint '{constraint_id}' not found."
         )
 
+   
     def confirm(self, version: int) -> ProblemSnapshot:
-        ...
+        """Create and store an immutable confirmed problem snapshot."""
+        if version < 1:
+            raise ValueError("Problem version must be positive.")
+
+        if not self.problem_id.strip():
+            raise ValueError("Problem ID cannot be empty.")
+
+        if not self.original_prompt.strip():
+            raise ValueError("Original prompt cannot be empty.")
+
+        if not self.objective.strip():
+            raise ValueError("Objective cannot be empty.")
+
+        snapshot = ProblemSnapshot(
+            problem_id=self.problem_id,
+            version=version,
+            original_prompt=self.original_prompt,
+            objective=self.objective,
+            constraints=tuple(self.constraints),
+        )
+
+        self.version_history.add_snapshot(snapshot)
+
+        return snapshot
+
 
     
     def create_memento(self) -> ProblemMemento:
