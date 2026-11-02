@@ -3,6 +3,7 @@
 
 from abc import ABC, abstractmethod
 from uuid import uuid4
+from collections.abc import Callable
 
 from taip.benchmark.models import BenchmarkDataset, BenchmarkResult
 from taip.benchmark.observer import (
@@ -82,24 +83,87 @@ class BenchmarkRunner(ABC):
 
 
 class MathematicalBenchmarkRunner(BenchmarkRunner):
-    """Runs a benchmark using mathematical test cases."""
+    """Concrete benchmark runner using a supplied dataset and solver."""
+
+    source_dataset: BenchmarkDataset
+    solver: Callable[[str], str]
 
     def load_dataset(self) -> BenchmarkDataset:
-        raise NotImplementedError(
-            "Mathematical dataset loading must be implemented."
-        )
+        """Load the configured mathematical benchmark dataset."""
+        if not hasattr(self, "source_dataset"):
+            raise ValueError("No benchmark dataset was configured.")
+
+        if not isinstance(self.source_dataset, BenchmarkDataset):
+            raise TypeError("Expected a BenchmarkDataset.")
+
+        return self.source_dataset
 
     def execute_cases(self) -> None:
-        raise NotImplementedError(
-            "Mathematical case execution must be implemented."
-        )
+        """Execute every case and collect model outputs."""
+        if self.dataset is None:
+            raise RuntimeError("Dataset must be loaded first.")
+
+        if not hasattr(self, "solver") or not callable(self.solver):
+            raise ValueError("No benchmark solver was configured.")
+
+        self.case_results: list[dict[str, object]] = []
+
+        for case in self.dataset.cases:
+            actual = self.solver(case.problem_statement)
+
+            # Accept harmless whitespace differences.
+            correct = (
+                isinstance(actual, str)
+                and actual.strip() == case.expected_result.strip()
+            )
+
+            self.case_results.append(
+                {
+                    "case_id": case.case_id,
+                    "expected": case.expected_result,
+                    "actual": actual,
+                    "correct": correct,
+                }
+            )
 
     def evaluate_results(self) -> BenchmarkResult:
-        raise NotImplementedError(
-            "Mathematical result evaluation must be implemented."
+        """Compute exact-match accuracy for the benchmark."""
+        if self.dataset is None:
+            raise RuntimeError("Dataset must be loaded first.")
+
+        if not hasattr(self, "case_results"):
+            raise RuntimeError("Cases must be executed first.")
+
+        total = len(self.dataset.cases)
+        successful = sum(
+            1 for entry in self.case_results if entry["correct"]
         )
 
-    def generate_report(self) -> None:
-        raise NotImplementedError(
-            "Mathematical report generation must be implemented."
+        score = successful / total if total > 0 else None
+
+        self.last_result = BenchmarkResult(
+            benchmark_id=self.benchmark_id,
+            dataset_version=self.dataset.version,
+            model_id=self.model_id,
+            total_cases=total,
+            successful_cases=successful,
+            score=score,
         )
+        return self.last_result
+
+    def generate_report(self) -> None:
+        """Build an in-memory benchmark report."""
+        if not hasattr(self, "last_result"):
+            raise RuntimeError("Results must be evaluated first.")
+
+        result = self.last_result
+
+        self.report = {
+            "benchmark_id": result.benchmark_id,
+            "dataset_version": result.dataset_version,
+            "model_id": result.model_id,
+            "total_cases": result.total_cases,
+            "successful_cases": result.successful_cases,
+            "score": result.score,
+            "cases": list(self.case_results),
+        }
