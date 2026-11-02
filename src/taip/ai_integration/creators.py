@@ -1,4 +1,5 @@
-"""AI-02: declare the Factory Method hierarchy for the existing adapters."""
+
+"""Factory Method implementation for AI model adapters."""
 
 from abc import ABC, abstractmethod
 
@@ -16,39 +17,48 @@ from taip.ai_integration.provider_clients import (
 
 
 class ModelAdapterCreator(ABC):
-    """Abstract creator consumed without knowledge of concrete products."""
+    """Abstract creator for AI model adapters."""
 
     @abstractmethod
     def create_adapter(self) -> AIModelAdapter:
-        """Declare the factory method returning the common product interface."""
+        """Create an adapter through the common interface."""
         ...
 
 
 class OpenAIAdapterCreator(ModelAdapterCreator):
-    """Declare creation of the OpenAI adapter using its client dependency."""
+    """Factory for OpenAI adapters."""
 
     model_id: str
     client: OpenAIClient
 
     def create_adapter(self) -> OpenAIAdapter:
-        ...
+        adapter = OpenAIAdapter()
+        adapter.model_id = self.model_id
+        adapter.client = self.client
+        return adapter
 
 
 class GeminiAdapterCreator(ModelAdapterCreator):
-    """Declare creation of the Gemini adapter using its client dependency."""
+    """Factory for Gemini adapters."""
 
     model_id: str
     client: GeminiClient
 
     def create_adapter(self) -> GeminiAdapter:
-        ...
+        adapter = GeminiAdapter()
+        adapter.model_id = self.model_id
+        adapter.client = self.client
+        return adapter
 
 
 class ThirdModelAdapterCreator(ModelAdapterCreator):
-    """Declare creation of an adapter without selecting a third provider."""
+    """Factory for the third AI model adapter."""
 
     model_id: str
     client: ThirdModelClient
 
     def create_adapter(self) -> ThirdModelAdapter:
-        ...
+        adapter = ThirdModelAdapter()
+        adapter.model_id = self.model_id
+        adapter.client = self.client
+        return adapter
