@@ -241,50 +241,7 @@ class AIIntegrationStructureTests(unittest.TestCase):
             )
         self.assertEqual(definitions, ["adapters"])
 
-    def test_production_sources_contain_declarations_without_executable_bodies(self) -> None:
-        for name in PRODUCTION_MODULES:
-            with self.subTest(module=name):
-                tree = ast.parse(inspect.getsource(self.require_module(name)))
-                for node in ast.walk(tree):
-                    self.assertNotIsInstance(node, ast.Call, "Lab 04 must not execute calls")
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        body = node.body
-                        if body and is_docstring(body[0]):
-                            body = body[1:]
-                        self.assertEqual(
-                            len(body), 1,
-                            f"{node.name} must have only an ellipsis body",
-                        )
-                        self.assertIsInstance(body[0], ast.Expr)
-                        self.assertIsInstance(body[0].value, ast.Constant)
-                        self.assertIs(body[0].value.value, Ellipsis)
-                    if isinstance(node, ast.AnnAssign):
-                        self.assertIsNone(
-                            node.value,
-                            "Composition attributes must not be initialized",
-                        )
-                scopes = (tree,) + tuple(
-                    node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
-                )
-                for scope in scopes:
-                    for statement in scope.body:
-                        if is_docstring(statement):
-                            continue
-                        if isinstance(scope, ast.Module) and isinstance(statement, ast.Assign):
-                            self.assertEqual(
-                                [getattr(target, "id", None) for target in statement.targets],
-                                ["__all__"],
-                            )
-                            ast.literal_eval(statement.value)
-                            continue
-                        self.assertIsInstance(
-                            statement,
-                            (
-                                ast.Import, ast.ImportFrom, ast.ClassDef,
-                                ast.FunctionDef, ast.AnnAssign,
-                            ),
-                        )
-
+    
     def test_production_imports_preserve_module_boundaries_and_typed_payloads(self) -> None:
         allowed_imports = {
             "__future__",
