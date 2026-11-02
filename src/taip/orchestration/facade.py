@@ -8,6 +8,7 @@ from taip.common.contracts import (
     ModelResponse,
     ProblemSnapshot,
     VerificationResult,
+    ModelStatus,
 )
 from taip.orchestration.execution import (
     ExecutionResultCollector,
@@ -68,15 +69,60 @@ class ModelExecutionCoordinator:
         )
 
     def execute(
-        self,
-        execution_run: ExecutionRunContract,
-        model_adapters: tuple[
-            AIModelAdapter,
-            AIModelAdapter,
-            AIModelAdapter,
-        ],
+            self,
+            execution_run: ExecutionRunContract,
+            model_adapters: tuple[
+                AIModelAdapter,
+                AIModelAdapter,
+                AIModelAdapter,
+            ],
     ) -> tuple[ModelResponse, ModelResponse, ModelResponse]:
-        ...
+        """Execute all three adapters, isolating provider failures."""
+        if len(model_adapters) != 3:
+            raise ValueError("Exactly three model adapters are required.")
+
+        if len(set(execution_run.model_ids)) != 3:
+            raise ValueError("Model identifiers must be unique.")
+
+        for expected_id, adapter in zip(
+                execution_run.model_ids, model_adapters
+        ):
+            if adapter.get_model_identifier() != expected_id:
+                raise ValueError(
+                    f"Adapter does not match model {expected_id}."
+                )
+
+        requests = self.create_requests(execution_run)
+        responses: list[ModelResponse] = []
+
+        for adapter, request in zip(model_adapters, requests):
+            try:
+                response = adapter.generate_solution(
+                    request,
+                    run_id=execution_run.run_id,
+                )
+
+                if (
+                        response.model_id != request.model_id
+                        or response.run_id != execution_run.run_id
+                ):
+                    raise ValueError(
+                        "Provider returned inconsistent identifiers."
+                    )
+
+                responses.append(response)
+
+            except Exception:
+                responses.append(
+                    ModelResponse(
+                        model_id=request.model_id,
+                        run_id=execution_run.run_id,
+                        output=None,
+                        status=ModelStatus.FAILED,
+                    )
+                )
+
+        return tuple(responses)
 
 
 class ProblemOrchestrator:
