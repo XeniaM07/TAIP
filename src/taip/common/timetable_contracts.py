@@ -245,6 +245,8 @@ class ConstraintViolation:
     constraint_id: str | None = None
     requirement_ids: tuple[str, ...] = ()
     slot_ids: tuple[str, ...] = ()
+    severity: ConstraintSeverity = ConstraintSeverity.HARD
+    lessons: tuple[LessonAssignment, ...] = ()
 
 
 class VerificationStatus(str, Enum):
