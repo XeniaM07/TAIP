@@ -1,0 +1,43 @@
+{
+  "solution_id": "solution-valid",
+  "snapshot_id": "snapshot-gemini-v1",
+  "model_id": "gemini",
+  "assignments": [
+    {
+      "requirement_id": "req-1",
+      "occurrence": 0,
+      "slot_id": "mon-1",
+      "room_id": "r101"
+    },
+    {
+      "requirement_id": "req-1",
+      "occurrence": 1,
+      "slot_id": "tue-1",
+      "room_id": "r101"
+    },
+    {
+      "requirement_id": "req-2",
+      "occurrence": 0,
+      "slot_id": "mon-2",
+      "room_id": "lab"
+    },
+    {
+      "requirement_id": "req-3",
+      "occurrence": 0,
+      "slot_id": "mon-1",
+      "room_id": "lab"
+    },
+    {
+      "requirement_id": "req-3",
+      "occurrence": 1,
+      "slot_id": "tue-2",
+      "room_id": "r101"
+    },
+    {
+      "requirement_id": "req-4",
+      "occurrence": 0,
+      "slot_id": "mon-2",
+      "room_id": "r101"
+    }
+  ]
+}
