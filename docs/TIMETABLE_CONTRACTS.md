@@ -30,8 +30,14 @@ All canonical types are frozen, slotted Python dataclasses unless they are enums
 | `TimetableProblemSnapshot` | `snapshot_id`, `draft_id`, `problem_id`, `model_id`, `version`, `original_prompt`, `data` | Explicitly confirmed version |
 | `LessonAssignment` | `requirement_id`, zero-based `occurrence`, `slot_id`, `room_id` | One scheduled lesson |
 | `TimetableSolution` | `solution_id`, `snapshot_id`, `model_id`, assignments | Model output |
+| `ConstraintViolation` | rule code, severity, optional constraint ID, implicated lessons | Structured verification finding |
 | `TimetableVerificationResult` | solution/snapshot IDs, status, violations, optional soft penalty | Independent verification |
 | `ModelRunResult`, `ComparisonRun` | per-model IDs, durations, edit counts, verification status | Benchmark comparison |
+
+Each `ConstraintViolation` reports a stable rule `code`, optional configured
+`constraint_id`, severity, and the complete `LessonAssignment` records involved
+in the finding. Soft findings are included in `violations` and contribute to
+`soft_penalty`; they do not make verification fail.
 
 `Weekday` supports Monday–Friday. `ConstraintSeverity` is `hard` or `soft`. `VerificationStatus` is `verified`, `failed`, or `inconclusive`. `ConstraintType` and its matching parameter dataclasses are defined in `timetable_contracts.py`; consumers must not invent additional constraint names in JSON.
 
@@ -47,7 +53,15 @@ MVP lessons each occupy **exactly one** `TimeSlot`; no class subdivisions or mul
 6. Explicit hard teacher/room/class unavailability, required room features, room capacity when known, and hard maximum daily class periods must be enforced.
 7. Soft constraints (teacher preferences, teacher/class gaps, daily class load balance) contribute to an explained penalty rather than making an otherwise feasible timetable invalid.
 
-Missing required data or unresolved references block confirmation. An AI must report missing information rather than silently inventing a teacher, class, room, slot, or lesson count. Unsupported requests must be surfaced as `unsupported_requirements`; they must not silently disappear. Validation of these invariants is **not yet implemented** merely by defining frozen dataclasses.
+The verifier reports `FAILED` when any hard violation is found, `INCONCLUSIVE`
+when no hard violation is found but required evidence is missing, and `VERIFIED`
+only when all checks can be evaluated. `soft_penalty` is the weighted sum of
+soft findings: one unit per dispreferred lesson, empty period between
+consecutive scheduled periods, or pairwise difference in daily lesson counts
+across days with scheduled lessons, multiplied by the configured constraint
+weight.
+
+Missing required data or unresolved references block confirmation. An AI must report missing information rather than silently inventing a teacher, class, room, slot, or lesson count. Unsupported requests must be surfaced as `unsupported_requirements`; they must not silently disappear. Frozen dataclasses alone do not enforce these invariants; draft validation and independent solution verification implement their respective checks.
 
 ## 4. Five module interfaces
 
