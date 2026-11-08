@@ -1,0 +1,191 @@
+{
+  "proposal_id": "proposal-llama",
+  "problem_id": "school-demo",
+  "model_id": "llama",
+  "data": {
+    "classes": [
+      {
+        "class_id": "5A",
+        "name": "Clasa a V-a A",
+        "student_count": 25
+      },
+      {
+        "class_id": "6A",
+        "name": "Clasa a VI-a A",
+        "student_count": 24
+      }
+    ],
+    "teachers": [
+      {
+        "teacher_id": "t-math",
+        "name": "Ana Popescu",
+        "subject_ids": [
+          "math"
+        ]
+      },
+      {
+        "teacher_id": "t-ro",
+        "name": "Mihai Ionescu",
+        "subject_ids": [
+          "ro"
+        ]
+      },
+      {
+        "teacher_id": "t-info",
+        "name": "Elena Georgescu",
+        "subject_ids": [
+          "info"
+        ]
+      }
+    ],
+    "subjects": [
+      {
+        "subject_id": "math",
+        "name": "Matematică"
+      },
+      {
+        "subject_id": "ro",
+        "name": "Limba română"
+      },
+      {
+        "subject_id": "info",
+        "name": "Informatică"
+      }
+    ],
+    "rooms": [
+      {
+        "room_id": "r101",
+        "name": "Sala 101",
+        "capacity": 30,
+        "features": []
+      },
+      {
+        "room_id": "lab",
+        "name": "Laborator informatică",
+        "capacity": 28,
+        "features": [
+          "computers"
+        ]
+      }
+    ],
+    "time_slots": [
+      {
+        "slot_id": "mon-1",
+        "day": "monday",
+        "period": 1,
+        "start_time": null,
+        "end_time": null
+      },
+      {
+        "slot_id": "mon-2",
+        "day": "monday",
+        "period": 2,
+        "start_time": null,
+        "end_time": null
+      },
+      {
+        "slot_id": "mon-3",
+        "day": "monday",
+        "period": 3,
+        "start_time": null,
+        "end_time": null
+      },
+      {
+        "slot_id": "tue-1",
+        "day": "tuesday",
+        "period": 1,
+        "start_time": null,
+        "end_time": null
+      },
+      {
+        "slot_id": "tue-2",
+        "day": "tuesday",
+        "period": 2,
+        "start_time": null,
+        "end_time": null
+      },
+      {
+        "slot_id": "tue-3",
+        "day": "tuesday",
+        "period": 3,
+        "start_time": null,
+        "end_time": null
+      }
+    ],
+    "requirements": [
+      {
+        "requirement_id": "req-1",
+        "class_id": "5A",
+        "subject_id": "math",
+        "teacher_id": "t-math",
+        "sessions_per_week": 2
+      },
+      {
+        "requirement_id": "req-2",
+        "class_id": "5A",
+        "subject_id": "info",
+        "teacher_id": "t-info",
+        "sessions_per_week": 1
+      },
+      {
+        "requirement_id": "req-3",
+        "class_id": "6A",
+        "subject_id": "ro",
+        "teacher_id": "t-ro",
+        "sessions_per_week": 2
+      },
+      {
+        "requirement_id": "req-4",
+        "class_id": "6A",
+        "subject_id": "math",
+        "teacher_id": "t-math",
+        "sessions_per_week": 1
+      }
+    ],
+    "constraints": [
+      {
+        "constraint_id": "con-1",
+        "type": "room_feature_required",
+        "severity": "hard",
+        "parameters": {
+          "requirement_id": "req-2",
+          "feature": "computers"
+        },
+        "weight": 1,
+        "source_text": null
+      },
+      {
+        "constraint_id": "con-2",
+        "type": "teacher_unavailable",
+        "severity": "hard",
+        "parameters": {
+          "teacher_id": "t-math",
+          "slot_ids": [
+            "mon-3"
+          ]
+        },
+        "weight": 1,
+        "source_text": null
+      },
+      {
+        "constraint_id": "con-3",
+        "type": "minimize_class_gaps",
+        "severity": "soft",
+        "parameters": {
+          "class_id": null
+        },
+        "weight": 2,
+        "source_text": null
+      }
+    ]
+  },
+  "missing_information": [
+    {
+      "code": "CHECK_ROOM",
+      "message": "Confirmă laboratorul disponibil",
+      "path": "rooms"
+    }
+  ],
+  "unsupported_requirements": [],
+  "raw_response": null
+}
