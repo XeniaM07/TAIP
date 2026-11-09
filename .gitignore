@@ -4,6 +4,8 @@ __pycache__/
 
 # Virtual environment
 .venv/
+.venv-*/
+.uv-cache/
 
 # Environment variables
 .env
@@ -18,3 +20,5 @@ __pycache__/
 
 
 *.egg-info/
+node_modules/
+dist/

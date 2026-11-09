@@ -9,6 +9,7 @@ This is a **proposed** module decomposition based on the Lab 03 analysis. Owners
 | `mathematical_verification` | AI 3 | Independent verification and unsupported-case routing | Strategy, Chain of Responsibility |
 | `benchmark` | AI 4 | Independent, versioned model benchmark and result notifications | Template Method, Observer |
 | `orchestration` | Distributed Systems | Execution coordination, per-model failure representation, overall lifecycle | Facade, State |
+| `application` | Application layer | HTTP API, workflow Facade, session repository, provider and verification composition | Facade, Dependency Injection |
 
 ## Contract ownership
 
@@ -29,6 +30,7 @@ All module owners import shared contracts from `taip.common.contracts`; do **not
 - `mathematical_verification`: may import `common`.
 - `benchmark`: may import `common` and use published model interface types, without importing orchestration internals.
 - `orchestration`: may import `common`, `ai_integration`, and public verification interfaces.
+- `application`: composes `common`, `problem_management`, and public mathematical verification interfaces; it is the outermost TAIP layer and may expose them over HTTP.
 
 Dependencies on concrete classes across module boundaries should be avoided; use public interfaces. If an interface is needed by multiple modules, agree on its home before implementing it.
 
@@ -39,7 +41,13 @@ Dependencies on concrete classes across module boundaries should be avoided; use
 - `VerificationHandler` composes its corresponding `VerificationStrategy`. `VerificationCoordinator` depends on the public handler abstraction rather than a concrete handler.
 - `ExecutionRunContext` relates the run to three independent `ModelExecution` records and an `ExecutionState`. The result collector returns those model records so a failed model remains represented. `PartialState` corresponds to `ExecutionStatus.PARTIAL`.
 
-All production methods remain declarations only. These type relationships represent the intended integration; they do not enforce runtime behavior.
+The original Lab 04 diagrams capture planned relationships between components; the Lab 06 application below wires the timetable workflow through the published interfaces.
+
+## Lab 06 application flow
+
+`taip.application.api` defines the FastAPI contract. `WorkflowService` is the application Facade and receives a `SessionRepository`, `ProviderFactory`, and `VerificationPort`; provider and verifier implementations can be replaced without changing route schemas. Each session owns three `ModelWorkspace` instances, each with an isolated `ProblemManagementPort` backed by an in-memory repository, plus its own draft, immutable confirmed snapshot, solution, and verification result. The outer session repository is lock-protected and purges sessions after two hours without access. The API requires the session UUID on all operations, has no account/authentication or persistent storage, and returns 404 for missing or expired sessions.
+
+The lifecycle states are `PENDING → EXTRACTING → DRAFT → CONFIRMED → SOLVING → COMPLETED`, with `FAILED` recorded on extraction/solving errors. The mock provider produces a small static sample timetable; prompts are retained for correlation but are not semantically parsed. Timetable verification uses the existing Strategy/Chain and `monitored_verify` decorator. Application events log session/model identifiers, transitions, durations, and errors, without prompt contents. The React client is in `frontend/` and calls only `/api` contracts.
 
 ## Core invariants from Lab 03
 
