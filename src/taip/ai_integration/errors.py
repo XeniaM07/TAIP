@@ -13,3 +13,12 @@ class AIResponseError(ValueError):
         self.path = path
         self.raw_response: str | None = None
         super().__init__(f"{code} at {path}: {message}")
+
+
+class AIConfigurationError(ValueError):
+    """Identify an invalid configuration field without retaining its value."""
+
+    def __init__(self, field: str) -> None:
+        self.code = "configuration_error"
+        self.field = field
+        super().__init__("Invalid AI provider configuration.")

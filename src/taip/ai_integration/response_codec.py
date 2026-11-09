@@ -15,22 +15,13 @@ from types import UnionType
 from typing import TypeVar, Union, get_args, get_origin, get_type_hints
 from uuid import uuid4
 
+from taip.ai_integration.constraint_parameters import CONSTRAINT_PARAMETER_TYPES
 from taip.ai_integration.errors import AIResponseError
 from taip.common.timetable_contracts import (
-    BalanceClassDailyLoad,
-    ClassUnavailable,
-    ConstraintType,
     ExtractionProposal,
     LessonAssignment,
-    MaxClassPeriodsPerDay,
-    MinimizeClassGaps,
-    MinimizeTeacherGaps,
     MissingInformation,
     OriginalProblem,
-    RoomFeatureRequired,
-    RoomUnavailable,
-    TeacherPreferredSlots,
-    TeacherUnavailable,
     TimetableConstraint,
     TimetableData,
     TimetableProblemSnapshot,
@@ -39,17 +30,6 @@ from taip.common.timetable_contracts import (
 
 
 _T = TypeVar("_T")
-_PARAMETER_TYPES = {
-    ConstraintType.TEACHER_UNAVAILABLE: TeacherUnavailable,
-    ConstraintType.ROOM_UNAVAILABLE: RoomUnavailable,
-    ConstraintType.CLASS_UNAVAILABLE: ClassUnavailable,
-    ConstraintType.ROOM_FEATURE_REQUIRED: RoomFeatureRequired,
-    ConstraintType.MAX_CLASS_PERIODS_PER_DAY: MaxClassPeriodsPerDay,
-    ConstraintType.TEACHER_PREFERRED_SLOTS: TeacherPreferredSlots,
-    ConstraintType.MINIMIZE_TEACHER_GAPS: MinimizeTeacherGaps,
-    ConstraintType.MINIMIZE_CLASS_GAPS: MinimizeClassGaps,
-    ConstraintType.BALANCE_CLASS_DAILY_LOAD: BalanceClassDailyLoad,
-}
 
 
 def _schema_error(path: str, message: str) -> AIResponseError:
@@ -122,7 +102,7 @@ def _record(record_type: type[_T], value: object, path: str) -> _T:
             continue
         annotation = hints[field.name]
         if record_type is TimetableConstraint and field.name == "parameters":
-            annotation = _PARAMETER_TYPES[arguments["type"]]
+            annotation = CONSTRAINT_PARAMETER_TYPES[arguments["type"]]
         arguments[field.name] = _value(annotation, payload[field.name], f"{path}.{field.name}")
     return record_type(**arguments)
 

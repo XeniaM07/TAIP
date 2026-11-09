@@ -1,0 +1,125 @@
+"""Explicit provider configuration, loaded only when requested by the caller."""
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from enum import Enum
+import math
+import os
+
+from taip.ai_integration.errors import AIConfigurationError
+
+
+class ProviderKind(str, Enum):
+    GEMINI = "gemini"
+    GROQ = "groq"
+    OPENROUTER = "openrouter"
+
+
+def _require_string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise AIConfigurationError(name)
+    return value
+
+
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderConfig:
+    """Separate the stable logical alias from the exact vendor model slug."""
+
+    model_id: str
+    provider: ProviderKind
+    api_model_id: str
+    api_key: str = field(repr=False)
+    timeout_seconds: float = 60.0
+    max_output_tokens: int = 8192
+    temperature: float = 0.0
+    max_response_bytes: int = 1048576
+    use_json_schema: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("model_id", "api_model_id", "api_key"):
+            _require_string(getattr(self, name), name)
+        if not isinstance(self.provider, ProviderKind):
+            raise AIConfigurationError("provider")
+        if not _is_finite_number(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise AIConfigurationError("timeout_seconds")
+        if not _is_finite_number(self.temperature) or not 0 <= self.temperature <= 2:
+            raise AIConfigurationError("temperature")
+        for name in ("max_output_tokens", "max_response_bytes"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise AIConfigurationError(name)
+        if type(self.use_json_schema) is not bool:
+            raise AIConfigurationError("use_json_schema")
+
+
+def _number_option(
+    environment: Mapping[str, str],
+    name: str,
+    default: int | float,
+    convert: Callable[[str], int | float],
+) -> int | float:
+    if name not in environment:
+        return default
+    value = _require_string(environment[name], name)
+    try:
+        return convert(value)
+    except (ValueError, OverflowError):
+        raise AIConfigurationError(name) from None
+
+
+def _schema_option(environment: Mapping[str, str], name: str) -> bool:
+    value = environment.get(name, "false")
+    if not isinstance(value, str) or value not in ("true", "false"):
+        raise AIConfigurationError(name)
+    return value == "true"
+
+
+def load_provider_configs(
+    environment: Mapping[str, str] | None = None,
+) -> tuple[ProviderConfig, ...]:
+    """Load all three providers from a supplied mapping or the current environment.
+
+    Every model slug and credential is required. No file is opened, no dotenv
+    state is merged, and an explicit mapping is used without environment fallbacks.
+    """
+    source = os.environ if environment is None else environment
+    controls = {
+        "timeout_seconds": _number_option(source, "TAIP_AI_TIMEOUT_SECONDS", 60.0, float),
+        "max_output_tokens": _number_option(source, "TAIP_AI_MAX_OUTPUT_TOKENS", 8192, int),
+        "temperature": _number_option(source, "TAIP_AI_TEMPERATURE", 0.0, float),
+        "max_response_bytes": _number_option(source, "TAIP_AI_MAX_RESPONSE_BYTES", 1048576, int),
+    }
+    control_fields = {
+        "timeout_seconds": "TAIP_AI_TIMEOUT_SECONDS",
+        "max_output_tokens": "TAIP_AI_MAX_OUTPUT_TOKENS",
+        "temperature": "TAIP_AI_TEMPERATURE",
+        "max_response_bytes": "TAIP_AI_MAX_RESPONSE_BYTES",
+    }
+    configs = []
+    for provider in ProviderKind:
+        prefix = provider.value.upper()
+        api_key = _require_string(source.get(f"{prefix}_API_KEY"), f"{prefix}_API_KEY")
+        api_model_id = _require_string(source.get(f"{prefix}_MODEL"), f"{prefix}_MODEL")
+        use_json_schema = _schema_option(source, f"{prefix}_JSON_SCHEMA")
+        try:
+            config = ProviderConfig(
+                model_id=provider.value,
+                provider=provider,
+                api_model_id=api_model_id,
+                api_key=api_key,
+                use_json_schema=use_json_schema,
+                **controls,
+            )
+        except AIConfigurationError as error:
+            raise AIConfigurationError(control_fields[error.field]) from None
+        configs.append(config)
+    return tuple(configs)
