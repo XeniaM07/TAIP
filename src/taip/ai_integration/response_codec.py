@@ -152,6 +152,15 @@ def _value(annotation: object, value: object, path: str) -> object:
     raise TypeError("Unsupported canonical field type")
 
 
+def decode_timetable_data(value: object) -> TimetableData:
+    """Reuse strict canonical shape and resource checks at trusted API seams."""
+    validate_domain_input(value, max_bytes=65536)
+    data = _record(TimetableData, value, "$.data")
+    validate_lesson_budget(data)
+    validate_domain_input(data, max_bytes=65536)
+    return data
+
+
 def parse_extraction_response(
     raw_response: str, *, problem: OriginalProblem, model_id: str
 ) -> ExtractionProposal:
@@ -168,9 +177,7 @@ def parse_extraction_response(
             required={"data"},
             path="$",
         )
-        data = _record(TimetableData, payload["data"], "$.data")
-        validate_lesson_budget(data)
-        validate_domain_input(data, max_bytes=65536)
+        data = decode_timetable_data(payload["data"])
         missing = _value(
             tuple[MissingInformation, ...], payload.get("missing_information", []),
             "$.missing_information",

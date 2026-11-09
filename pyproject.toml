@@ -14,7 +14,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = []
+test = ["fakeredis[lua]>=2.40,<3"]
+deployment = ["redis>=8.1,<9"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"taip.deployment" = ["quota.lua"]

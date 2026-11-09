@@ -1,0 +1,199 @@
+# Standalone stack: python -m taip.deployment.setup_public --directory <private-dir>
+# Then use its printed --env-file command. Only Caddy has host-published ports.
+# They bind loopback unless the operator explicitly configures another bind IP.
+x-python: &python
+  build:
+    context: .
+    dockerfile: deployment/Dockerfile
+  user: "${TAIP_APP_UID:-1000}:${TAIP_APP_GID:-1000}"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp:size=64m,mode=1777]
+  restart: unless-stopped
+  init: true
+  pids_limit: 128
+  mem_limit: 512m
+  cpus: 2
+
+x-redis-environment: &redis-environment
+  TAIP_REDIS_HOST: redis
+  TAIP_REDIS_PORT: "6379"
+  TAIP_REDIS_USERNAME: taip
+  TAIP_REDIS_NAMESPACE: taip:v1
+  TAIP_REDIS_PASSWORD_FILE: /run/secrets/redis_password
+  TAIP_INTERNAL_TOKEN_FILE: /run/secrets/internal_token
+  TAIP_ACCESS_TOKEN_SHA256_FILE: /run/secrets/access_token_hash
+  TAIP_PUBLIC_ORIGIN: ${TAIP_PUBLIC_ORIGIN:?Run the public setup helper first}
+
+services:
+  redis:
+    image: redis:8.4.8-alpine
+    user: "${TAIP_APP_UID:-1000}:${TAIP_APP_GID:-1000}"
+    command:
+      - redis-server
+      - --bind
+      - 0.0.0.0
+      - --protected-mode
+      - "yes"
+      - --aclfile
+      - /run/secrets/redis_acl
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - always
+      - --save
+      - ""
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+      - --dir
+      - /data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:size=16m,mode=1777]
+    restart: unless-stopped
+    pids_limit: 64
+    mem_limit: 384m
+    cpus: 1
+    volumes:
+      - type: bind
+        source: ${TAIP_REDIS_DATA_DIR:?Run the public setup helper first}
+        target: /data
+        bind:
+          create_host_path: false
+    secrets: [redis_acl, redis_password]
+    networks: [private]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$(cat /run/secrets/redis_password)" redis-cli --user taip --no-auth-warning --raw ping | grep -qx PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  core:
+    <<: *python
+    # The workflow is in memory: this service must have exactly one process.
+    command: [uvicorn, taip.deployment.core:create_core_app, --factory, --host, 0.0.0.0, --port, "8000", --workers, "1", --no-proxy-headers]
+    deploy:
+      replicas: 1
+    environment:
+      <<: *redis-environment
+      TAIP_LIVE_AI: "false"
+    secrets: [access_token_hash, internal_token, redis_password]
+    networks:
+      private:
+        aliases: [api]
+      egress: {}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "from pathlib import Path; from urllib.request import Request,urlopen; token=Path('/run/secrets/internal_token').read_text().strip(); urlopen(Request('http://127.0.0.1:8000/api/health',headers={'Authorization':'Bearer '+token}),timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  gateway:
+    <<: *python
+    command: [uvicorn, taip.deployment.gateway:create_gateway_app, --factory, --host, 0.0.0.0, --port, "8000", --workers, "${TAIP_GATEWAY_WORKERS:-2}", --no-proxy-headers]
+    environment:
+      <<: *redis-environment
+      TAIP_CORE_URL: http://core:8000
+      TAIP_WEB_URL: http://web:80
+      TAIP_GATEWAY_WORKERS: "${TAIP_GATEWAY_WORKERS:-2}"
+      TAIP_TLS_TERMINATED_BY_PROXY: "true"
+    secrets: [access_token_hash, internal_token, redis_password]
+    networks: [private]
+    depends_on:
+      core:
+        condition: service_healthy
+      web:
+        condition: service_started
+    healthcheck:
+      test: [CMD, python, -c, "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/healthz',timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    user: "101:101"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    tmpfs:
+      - /var/cache/nginx:size=32m,uid=101,gid=101,mode=0700
+      - /var/run:size=1m,uid=101,gid=101,mode=0700
+      - /tmp:size=16m,mode=1777
+    restart: unless-stopped
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 1
+    networks: [private]
+    depends_on:
+      core:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2.11.9-alpine
+    user: "${TAIP_APP_UID:-1000}:${TAIP_APP_GID:-1000}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:size=32m,mode=1777]
+    restart: unless-stopped
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    environment:
+      TAIP_DOMAIN: ${TAIP_DOMAIN:?Run the public setup helper first}
+      TAIP_PUBLIC_ORIGIN: ${TAIP_PUBLIC_ORIGIN:?Run the public setup helper first}
+    ports:
+      - target: 8080
+        published: "${TAIP_HTTP_PORT:-8080}"
+        host_ip: "${TAIP_BIND_ADDRESS:-127.0.0.1}"
+        protocol: tcp
+      - target: 8443
+        published: "${TAIP_HTTPS_PORT:-8443}"
+        host_ip: "${TAIP_BIND_ADDRESS:-127.0.0.1}"
+        protocol: tcp
+    volumes:
+      - ./deployment/Caddyfile:/etc/caddy/Caddyfile:ro
+      - type: bind
+        source: ${TAIP_CADDY_DATA_DIR:?Run the public setup helper first}
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${TAIP_CADDY_CONFIG_DIR:?Run the public setup helper first}
+        target: /config
+        bind:
+          create_host_path: false
+    networks: [private, egress]
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+networks:
+  private:
+    internal: true
+  egress: {}
+
+secrets:
+  access_token_hash:
+    file: ${TAIP_ACCESS_TOKEN_SHA256_FILE:?Run the public setup helper first}
+  internal_token:
+    file: ${TAIP_INTERNAL_TOKEN_FILE:?Run the public setup helper first}
+  redis_password:
+    file: ${TAIP_REDIS_PASSWORD_FILE:?Run the public setup helper first}
+  redis_acl:
+    file: ${TAIP_REDIS_ACL_FILE:?Run the public setup helper first}
