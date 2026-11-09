@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Callable
+from dataclasses import asdict, dataclass, field
+import json
+from typing import Callable, ClassVar
 
 from taip.common.timetable_contracts import (
     BalanceClassDailyLoad,
@@ -31,16 +32,103 @@ from taip.common.timetable_contracts import (
     TimetableSolution,
     VerificationStatus,
 )
+from taip.common.timetable_integrity import (
+    MAX_TOTAL_SESSIONS,
+    iter_timetable_integrity_issues,
+)
+
+
+class _VerificationBudgetExceeded(Exception):
+    """Internal control flow: stop checks once their bounded report is full."""
 
 
 @dataclass(slots=True)
 class VerificationContext:
+    """Bound report construction before serialization, preserving uncertainty."""
+
+    MAX_FINDINGS: ClassVar[int] = 500
+    MAX_ATTACHED_LESSONS: ClassVar[int] = 2000
+    MAX_DETAIL_BYTES: ClassVar[int] = 512 * 1024
+    MAX_LESSONS_PER_FINDING: ClassVar[int] = 100
+    _DETAIL_RESERVE: ClassVar[int] = 4096
+    _TRUNCATION_NOTE: ClassVar[str] = (
+        "Verification details truncated at the resource budget; remaining "
+        "checks and the soft penalty may be incomplete."
+    )
+
     snapshot: TimetableProblemSnapshot
     solution: TimetableSolution
     violations: list[ConstraintViolation] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     soft_penalty: int = 0
     inconclusive: bool = False
+    stop_verification: bool = False
+    _hard_failure: bool = field(default=False, init=False)
+    _attached_lessons: int = field(default=0, init=False)
+    _detail_bytes: int = field(default=0, init=False)
+    _finding_bytes: list[int] = field(default_factory=list, init=False)
+
+    def _mark_truncated(self) -> None:
+        self.inconclusive = True
+        if self._TRUNCATION_NOTE not in self.notes:
+            self.notes.append(self._TRUNCATION_NOTE)
+
+    def _bounded_text(self, value: str, maximum: int = 4096) -> str:
+        if len(value) <= maximum:
+            return value
+        self._mark_truncated()
+        return value[:maximum] + " [truncated]"
+
+    def _bounded_ids(self, values: tuple[str, ...]) -> tuple[str, ...]:
+        unique = tuple(dict.fromkeys(values))
+        bounded = tuple(value for value in unique[:100] if len(value) <= 4096)
+        if len(bounded) != len(unique):
+            self._mark_truncated()
+        return bounded
+
+    def _stop_at_budget(self, finding: ConstraintViolation | None = None) -> None:
+        self._mark_truncated()
+        self.stop_verification = True
+        # Retain the actual hard reason even if earlier soft details filled the
+        # budget. Never infer feasibility from only the retained sample.
+        if (
+            finding is not None
+            and finding.severity == ConstraintSeverity.HARD
+            and not any(
+                item.severity == ConstraintSeverity.HARD for item in self.violations
+            )
+        ):
+            compact = ConstraintViolation(
+                code=finding.code,
+                message=finding.message[:256],
+                severity=ConstraintSeverity.HARD,
+            )
+            size = len(json.dumps(asdict(compact)))
+            while self.violations and (
+                len(self.violations) >= self.MAX_FINDINGS
+                or self._detail_bytes + size > self.MAX_DETAIL_BYTES - self._DETAIL_RESERVE
+            ):
+                removed = self.violations.pop()
+                self._detail_bytes -= self._finding_bytes.pop()
+                self._attached_lessons -= len(removed.lessons)
+            self.violations.append(compact)
+            self._finding_bytes.append(size)
+            self._detail_bytes += size
+        raise _VerificationBudgetExceeded
+
+    def add_note(self, message: str) -> None:
+        """Include notes in the same byte/entry budget as violation details."""
+        message = self._bounded_text(message)
+        if message in self.notes:
+            return
+        size = len(json.dumps(message))
+        if (
+            len(self.notes) >= self.MAX_FINDINGS
+            or self._detail_bytes + size > self.MAX_DETAIL_BYTES - self._DETAIL_RESERVE
+        ):
+            self._stop_at_budget()
+        self.notes.append(message)
+        self._detail_bytes += size
 
     def add_finding(
         self,
@@ -52,25 +140,67 @@ class VerificationContext:
         requirement_ids: tuple[str, ...] | None = None,
         severity: ConstraintSeverity = ConstraintSeverity.HARD,
     ) -> None:
-        self.violations.append(
-            ConstraintViolation(
-                code=code,
-                message=message,
-                constraint_id=(
-                    constraint.constraint_id if constraint is not None else None
-                ),
-                requirement_ids=(
-                    requirement_ids
-                    if requirement_ids is not None
-                    else tuple(
-                        dict.fromkeys(lesson.requirement_id for lesson in lessons)
-                    )
-                ),
-                slot_ids=tuple(dict.fromkeys(lesson.slot_id for lesson in lessons)),
-                severity=severity,
-                lessons=lessons,
+        self._hard_failure |= severity == ConstraintSeverity.HARD
+        if len(self.violations) >= self.MAX_FINDINGS:
+            self._stop_at_budget(
+                ConstraintViolation(
+                    code=code, message=self._bounded_text(message), severity=severity,
+                )
             )
+        remaining = self.MAX_ATTACHED_LESSONS - self._attached_lessons
+        if lessons and remaining <= 0:
+            self._stop_at_budget(
+                ConstraintViolation(
+                    code=code, message=self._bounded_text(message), severity=severity,
+                )
+            )
+        sampled: dict[LessonAssignment, None] = {}
+        for lesson in lessons:
+            # Malformed or oversized occurrences cannot safely be serialized.
+            # Report their violation without copying that input payload.
+            if (
+                type(lesson.occurrence) is not int
+                or not -MAX_TOTAL_SESSIONS <= lesson.occurrence <= MAX_TOTAL_SESSIONS
+                or not all(
+                    isinstance(value, str) and len(value) <= 4096
+                    for value in (lesson.requirement_id, lesson.slot_id, lesson.room_id)
+                )
+            ):
+                self._mark_truncated()
+                continue
+            if lesson in sampled:
+                continue
+            if len(sampled) >= min(self.MAX_LESSONS_PER_FINDING, remaining):
+                self._mark_truncated()
+                break
+            sampled[lesson] = None
+        sampled_lessons = tuple(sampled)
+        constraint_id = constraint.constraint_id if constraint is not None else None
+        if constraint_id is not None and len(constraint_id) > 4096:
+            constraint_id = None
+            self._mark_truncated()
+        finding = ConstraintViolation(
+            code=code,
+            message=self._bounded_text(message),
+            constraint_id=constraint_id,
+            requirement_ids=self._bounded_ids(
+                requirement_ids
+                if requirement_ids is not None
+                else tuple(lesson.requirement_id for lesson in sampled_lessons)
+            ),
+            slot_ids=self._bounded_ids(
+                tuple(lesson.slot_id for lesson in sampled_lessons)
+            ),
+            severity=severity,
+            lessons=sampled_lessons,
         )
+        size = len(json.dumps(asdict(finding))) + 2
+        if self._detail_bytes + size > self.MAX_DETAIL_BYTES - self._DETAIL_RESERVE:
+            self._stop_at_budget(finding)
+        self.violations.append(finding)
+        self._finding_bytes.append(size)
+        self._detail_bytes += size
+        self._attached_lessons += len(sampled_lessons)
 
     def add_soft_finding(
         self,
@@ -92,7 +222,7 @@ class VerificationContext:
 
     @property
     def status(self) -> VerificationStatus:
-        if any(
+        if self._hard_failure or any(
             violation.severity == ConstraintSeverity.HARD
             for violation in self.violations
         ):
@@ -115,8 +245,13 @@ class TimetableVerificationHandler(ABC):
         return handler
 
     def handle(self, context: VerificationContext) -> None:
-        self._verify(context)
-        if self.next_handler is not None:
+        if context.stop_verification:
+            return
+        try:
+            self._verify(context)
+        except _VerificationBudgetExceeded:
+            return
+        if self.next_handler is not None and not context.stop_verification:
             self.next_handler.handle(context)
 
     @abstractmethod
@@ -143,6 +278,22 @@ class AssignmentIntegrityHandler(TimetableVerificationHandler):
             )
 
         data = snapshot.data
+        for issue in iter_timetable_integrity_issues(data):
+            context.stop_verification = True
+            code = (
+                "snapshot.invalid_sessions_per_week"
+                if issue.code == "INVALID_SESSIONS"
+                else f"snapshot.{issue.code.lower()}"
+            )
+            context.add_finding(code, f"{issue.path}: {issue.message}")
+        if len(solution.assignments) > MAX_TOTAL_SESSIONS:
+            context.stop_verification = True
+            context.add_finding(
+                "solution.lesson_resource_limit",
+                "Solution assignments exceed the supported limit of 10,000 lessons.",
+            )
+        if context.stop_verification:
+            return
         requirements: dict[str, TeachingRequirement] = {}
         slots: dict[str, TimeSlot] = {}
         rooms: dict[str, Room] = {}
@@ -217,7 +368,7 @@ class AssignmentIntegrityHandler(TimetableVerificationHandler):
             ):
                 context.add_finding(
                     "assignment.occurrence_out_of_range",
-                    f"Occurrence {lesson.occurrence} is outside the required range "
+                    "Occurrence is outside the required range "
                     f"for '{lesson.requirement_id}'.",
                     lessons=(lesson,),
                 )
@@ -267,7 +418,6 @@ class AssignmentIntegrityHandler(TimetableVerificationHandler):
                     "requirement.missing_occurrence",
                     f"Requirement '{requirement_id}' is missing occurrence "
                     f"{missing_occurrence}.",
-                    lessons=lessons,
                     requirement_ids=(requirement_id,),
                 )
             if requirement.class_id not in classes:
@@ -390,9 +540,15 @@ class ConstraintVerificationHandler(TimetableVerificationHandler):
                 continue
             if student_count is None or capacity is None:
                 context.inconclusive = True
-                context.notes.append(
+                occurrence_label = (
+                    str(lesson.occurrence)
+                    if type(lesson.occurrence) is int
+                    and -MAX_TOTAL_SESSIONS <= lesson.occurrence <= MAX_TOTAL_SESSIONS
+                    else "invalid"
+                )
+                context.add_note(
                     f"Room capacity cannot be checked for lesson "
-                    f"'{lesson.requirement_id}:{lesson.occurrence}' because class "
+                    f"'{lesson.requirement_id}:{occurrence_label}' because class "
                     "size or room capacity is unknown."
                 )
             elif student_count > capacity:
@@ -413,7 +569,11 @@ class ConstraintVerificationHandler(TimetableVerificationHandler):
         slots: dict[str, TimeSlot],
         lessons_by_requirement: dict[str, list[LessonAssignment]],
     ) -> None:
-        for constraint in context.snapshot.data.constraints:
+        # Check every hard rule before soft objectives can exhaust the report.
+        for constraint in sorted(
+            context.snapshot.data.constraints,
+            key=lambda item: item.severity == ConstraintSeverity.SOFT,
+        ):
             params = constraint.parameters
             if not self._parameters_match(constraint.type, params):
                 context.add_finding(

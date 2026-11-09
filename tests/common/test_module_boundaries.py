@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 ALLOWED_DEPENDENCIES = {
+    "deployment": {"deployment", "application", "common", "ai_integration", "mathematical_verification"},
     "common": {"common"},
     "problem_management": {"common", "problem_management"},
     "ai_integration": {"common", "ai_integration"},

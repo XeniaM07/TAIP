@@ -15,7 +15,7 @@ from taip.ai_integration.errors import (
 )
 from taip.ai_integration.http_transport import JSONTransport
 from taip.ai_integration.monitoring import (
-    InvocationObserver, capture_provider_response, monitor_ai_call,
+    InvocationObserver, capture_provider_response, capture_quota_settlement_pending, monitor_ai_call,
 )
 from taip.ai_integration.prompts import (
     PromptMessages, build_extraction_prompt, build_solution_prompt,
@@ -28,6 +28,7 @@ from taip.ai_integration.response_codec import parse_extraction_response, parse_
 from taip.ai_integration.response_schema import (
     extraction_json_schema, groq_response_schema, solution_json_schema,
 )
+from taip.ai_integration.settlement import SettlementPendingError, settlements
 from taip.ai_integration.telemetry import GenerationParameters, parse_provider_usage
 from taip.common.timetable_contracts import (
     ExtractionProposal, OriginalProblem, TimetableProblemSnapshot, TimetableSolution,
@@ -60,6 +61,11 @@ def _optional_string(value: object) -> str | None:
         return None
     if not isinstance(value, str) or not value.strip():
         raise AIProviderError("invalid_envelope")
+    try:
+        if len(value.encode("utf-8")) > 512 or any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise AIProviderError("invalid_envelope")
+    except UnicodeError:
+        raise AIProviderError("invalid_envelope") from None
     return value
 
 
@@ -164,11 +170,15 @@ class TimetableAIAdapter(ABC):
 
     def _post(self, url: str, headers: dict[str, str], body: dict[str, object]) -> dict[str, object]:
         size = measure_request(body, max_bytes=self._config.max_request_bytes)
-        permit = self._limiter.acquire(
-            self._quota_key, policy=self._config.rate_limits,
-            estimated_tokens=size + self._config.max_output_tokens + 128,
-            provider=self.provider_name, model_id=self.model_id,
-        )
+        try:
+            permit = settlements.acquire(
+                self._limiter, self._quota_key, policy=self._config.rate_limits,
+                estimated_tokens=size + self._config.max_output_tokens + 128,
+                provider=self.provider_name, model_id=self.model_id,
+            )
+        except SettlementPendingError:
+            capture_quota_settlement_pending()
+            raise
         usage = None
         cooldown = None
         try:
@@ -179,8 +189,8 @@ class TimetableAIAdapter(ABC):
             )
             envelope = _object(response)
             usage = parse_provider_usage(self._config.provider, envelope)
-            model = envelope.get("modelVersion" if self._provider_kind is ProviderKind.GEMINI else "model")
-            upstream = envelope.get("provider")
+            model = _optional_string(envelope.get("modelVersion" if self._provider_kind is ProviderKind.GEMINI else "model"))
+            upstream = _optional_string(envelope.get("provider"))
             capture_provider_response(
                 returned_model_id=model if isinstance(model, str) and model.strip() else None,
                 upstream_provider=upstream if isinstance(upstream, str) and upstream.strip() else None,
@@ -194,7 +204,9 @@ class TimetableAIAdapter(ABC):
                 cooldown = 60.0 if error.retry_after_seconds is None else error.retry_after_seconds
             raise
         finally:
-            permit.finish(actual_tokens=usage.total_tokens if usage else None, cooldown_seconds=cooldown)
+            if not permit.finish(actual_tokens=usage.total_tokens if usage else None,
+                                 cooldown_seconds=cooldown):
+                capture_quota_settlement_pending()
 
     @abstractmethod
     def _request(self, messages: PromptMessages, schema: dict[str, object]) -> ProviderCompletion:

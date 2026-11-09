@@ -1,0 +1,83 @@
+name: Deployment contracts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deployment-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  offline-and-real-redis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:8.4.8-alpine
+        ports: ["127.0.0.1:6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TAIP_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Install locked project and test dependencies
+        run: uv sync --all-extras --locked
+      - name: Run offline contracts and cross-process Redis contracts
+        run: uv run --no-sync python -m unittest discover -s tests -t .
+      - name: Prepare ephemeral private deployment configuration
+        id: bootstrap
+        run: uv run --no-sync python -m taip.deployment.setup_public --directory "$RUNNER_TEMP/taip-public"
+      - name: Validate standalone Compose configuration
+        run: |
+          docker compose --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml config --format json > "$RUNNER_TEMP/taip-public/compose.json"
+          uv run --no-sync python -c 'import json,os,pathlib; config=json.loads((pathlib.Path(os.environ["RUNNER_TEMP"])/"taip-public/compose.json").read_text()); assert {port["host_ip"] for port in config["services"]["caddy"]["ports"]} == {"127.0.0.1"}'
+      - name: Validate Caddy syntax with the deployment image
+        run: >-
+          docker run --rm
+          --network none
+          --read-only
+          --tmpfs /data
+          --tmpfs /config
+          --tmpfs /tmp
+          --cap-drop ALL
+          --security-opt no-new-privileges:true
+          -e TAIP_DOMAIN=localhost
+          -e TAIP_PUBLIC_ORIGIN=https://localhost:8443
+          -v "$PWD/deployment/Caddyfile:/etc/caddy/Caddyfile:ro"
+          caddy:2.11.9-alpine caddy validate
+          --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Build and start the isolated loopback stack
+        run: docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml up --build --wait --wait-timeout 180
+      - name: Verify two gateway workers and one private core worker
+        run: |
+          docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml exec -T gateway python -c 'import os,pathlib; commands=[p.read_bytes() for p in pathlib.Path("/proc").glob("[0-9]*/cmdline") if p.parent.name != str(os.getpid())]; assert sum(b"multiprocessing.spawn" in c and b"spawn_main" in c for c in commands) == 2'
+          docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml exec -T core python -c 'import os,pathlib; commands=[p.read_bytes() for p in pathlib.Path("/proc").glob("[0-9]*/cmdline") if p.parent.name != str(os.getpid())]; python_commands=[c for c in commands if c.split(b"\0",1)[0].rsplit(b"/",1)[-1].startswith(b"python")]; assert sum(b"uvicorn" in c and b"taip.deployment.core:create_core_app" in c for c in python_commands) == 1; assert not any(b"multiprocessing.spawn" in c and b"spawn_main" in c for c in commands)'
+      - name: Exercise HTTPS authentication and the existing mock workflow
+        run: uv run --no-sync python -m tests.deployment.smoke_public --directory "$RUNNER_TEMP/taip-public"
+      - name: Verify Redis outage fails closed
+        run: |
+          docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml stop redis
+          uv run --no-sync python -m tests.deployment.smoke_public --directory "$RUNNER_TEMP/taip-public" --expect-redis-unavailable
+      - name: Show bounded container diagnostics after a failure
+        if: failure() && steps.bootstrap.outcome == 'success'
+        run: docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml logs --no-color --tail 100 core gateway redis web caddy
+      - name: Stop the ephemeral stack
+        if: always() && steps.bootstrap.outcome == 'success'
+        run: docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml down --remove-orphans

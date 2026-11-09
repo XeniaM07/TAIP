@@ -1,0 +1,39 @@
+{
+	admin off
+	persist_config off
+	skip_install_trust
+	http_port 8080
+	https_port 8443
+	auto_https disable_redirects
+	servers {
+		max_header_size 32KB
+		timeouts {
+			read_header 10s
+			read_body 30s
+			write 360s
+			idle 60s
+		}
+	}
+}
+
+# Use the external origin for redirects, including the localhost HTTPS port.
+http://{$TAIP_DOMAIN}:8080 {
+	redir {$TAIP_PUBLIC_ORIGIN}{uri} 308
+}
+
+https://{$TAIP_DOMAIN}:8443 {
+	request_body {
+		max_size 1MB
+	}
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+	}
+	# Authentication and quota admission belong to every gateway worker.
+	reverse_proxy gateway:8000 {
+		transport http {
+			dial_timeout 3s
+			response_header_timeout 320s
+		}
+	}
+}

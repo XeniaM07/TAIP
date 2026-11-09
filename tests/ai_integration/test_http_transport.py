@@ -5,6 +5,7 @@ from email.utils import format_datetime
 from importlib import import_module, util
 import json
 import unittest
+from unittest.mock import patch
 
 import httpx
 
@@ -228,6 +229,16 @@ class HTTPTransportTests(unittest.TestCase):
             self.post(transport)
         self.assertEqual(caught.exception.code, "timeout")
         self.assertTrue(stream.closed)
+
+    def test_drip_feed_cannot_extend_an_operation_beyond_its_elapsed_budget(self):
+        stream = TrackedStream([b'{"x":', b'1}'])
+        transport = self.make_transport(lambda request: httpx.Response(200, stream=stream))
+        with patch.object(self.module, "monotonic", side_effect=[0, .1, 3.1], create=True):
+            with self.assertRaises(self.error) as caught:
+                self.post(transport, timeout_seconds=1)
+        self.assertEqual(caught.exception.code, "timeout")
+        self.assertTrue(stream.closed)
+        self.assertEqual(stream.read_count, 1)
 
     def test_connection_transport_is_reused_and_closed_by_context(self):
         wire = TrackedTransport()

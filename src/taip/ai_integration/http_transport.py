@@ -6,6 +6,7 @@ from email.utils import parsedate_to_datetime
 import json
 import math
 from types import TracebackType
+from time import monotonic
 from typing import Protocol
 
 import httpx
@@ -77,8 +78,9 @@ def _decode_envelope(content: bytes) -> dict[str, object]:
 class HTTPJSONTransport:
     """Own one connection pool; never retry, redirect, or use ambient proxies.
 
-    Timeout values apply to HTTPX connect/read/write/pool inactivity, rather
-    than a total wall-clock deadline. Identity encoding avoids an unbounded
+    HTTPX bounds each blocking phase by the timeout. Elapsed-time checks stop
+    streaming after three timeout intervals; one pending read may add at most
+    one interval. Identity encoding avoids an unbounded
     decompression allocation before the response byte limit can be checked.
     """
 
@@ -102,11 +104,14 @@ class HTTPJSONTransport:
     ) -> dict[str, object]:
         request_headers = httpx.Headers(headers)
         request_headers["Accept-Encoding"] = "identity"
+        deadline = monotonic() + 3 * timeout_seconds
         try:
             with self._client.stream(
                 "POST", url, headers=request_headers, json=dict(body),
                 timeout=timeout_seconds, follow_redirects=False,
             ) as response:
+                if monotonic() >= deadline:
+                    raise AIProviderError("timeout")
                 if not 200 <= response.status_code <= 299:
                     raise provider_error_for_status(
                         response.status_code,
@@ -117,6 +122,8 @@ class HTTPJSONTransport:
                     raise AIProviderError("unsupported_encoding")
                 content = bytearray()
                 for chunk in response.iter_bytes():
+                    if monotonic() >= deadline:
+                        raise AIProviderError("timeout")
                     if len(content) + len(chunk) > max_response_bytes:
                         raise AIProviderError("response_too_large")
                     content.extend(chunk)
