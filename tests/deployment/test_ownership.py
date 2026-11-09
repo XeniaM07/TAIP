@@ -2,8 +2,9 @@
 
 import importlib
 from importlib import util
-import time
+from threading import Event
 import unittest
+from unittest.mock import patch
 
 import fakeredis
 
@@ -59,20 +60,35 @@ class CoreOwnershipTests(unittest.TestCase):
         self.assertTrue(thread.daemon)
 
     def test_heartbeat_renews_current_lease_and_stops_on_close(self):
-        owner = self.owner(lease_seconds=0.3)
-        owner.start()
-        key = self.key()
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline and self.client.pttl(key) > 170:
-            time.sleep(0.01)
-        low_ttl = self.client.pttl(key)
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline and self.client.pttl(key) <= low_ttl:
-            time.sleep(0.01)
-        self.assertGreater(self.client.pttl(key), low_ttl)
-        self.assertTrue(owner.is_current())
-        thread = owner._thread
-        owner.close()
+        owner = self.owner(lease_seconds=3)
+        renewed = Event()
+        observations = []
+        original_eval = self.client.eval
+
+        def observed_eval(script, key_count, *arguments):
+            if script != self.module._RENEW:
+                return original_eval(script, key_count, *arguments)
+            key = arguments[0]
+            before = self.client.pttl(key)
+            result = original_eval(script, key_count, *arguments)
+            after = self.client.pttl(key)
+            observations.append((before, after, result))
+            renewed.set()
+            return result
+
+        # The heartbeat thread captures both TTLs around its real atomic Lua
+        # renewal, before another heartbeat can race a parent-thread read.
+        with patch.object(self.client, "eval", new=observed_eval):
+            owner.start()
+            key = self.key()
+            self.assertTrue(renewed.wait(5), "The owner must renew its live lease")
+            before, after, result = observations[0]
+            self.assertEqual(result, 1)
+            self.assertGreater(before, 0)
+            self.assertGreater(after, before)
+            self.assertTrue(owner.is_current())
+            thread = owner._thread
+            owner.close()
         self.assertFalse(thread.is_alive())
         self.assertFalse(owner.is_current())
         self.assertEqual(self.client.exists(key), 0)

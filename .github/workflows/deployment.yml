@@ -67,7 +67,7 @@ jobs:
       - name: Verify two gateway workers and one private core worker
         run: |
           docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml exec -T gateway python -c 'import os,pathlib; commands=[p.read_bytes() for p in pathlib.Path("/proc").glob("[0-9]*/cmdline") if p.parent.name != str(os.getpid())]; assert sum(b"multiprocessing.spawn" in c and b"spawn_main" in c for c in commands) == 2'
-          docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml exec -T core python -c 'import os,pathlib; commands=[p.read_bytes() for p in pathlib.Path("/proc").glob("[0-9]*/cmdline") if p.parent.name != str(os.getpid())]; assert sum(b"uvicorn" in c and b"taip.deployment.core:create_core_app" in c for c in commands) == 1; assert not any(b"multiprocessing.spawn" in c and b"spawn_main" in c for c in commands)'
+          docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml exec -T core python -c 'import os,pathlib; commands=[p.read_bytes() for p in pathlib.Path("/proc").glob("[0-9]*/cmdline") if p.parent.name != str(os.getpid())]; python_commands=[c for c in commands if c.split(b"\0",1)[0].rsplit(b"/",1)[-1].startswith(b"python")]; assert sum(b"uvicorn" in c and b"taip.deployment.core:create_core_app" in c for c in python_commands) == 1; assert not any(b"multiprocessing.spawn" in c and b"spawn_main" in c for c in commands)'
       - name: Exercise HTTPS authentication and the existing mock workflow
         run: uv run --no-sync python -m tests.deployment.smoke_public --directory "$RUNNER_TEMP/taip-public"
       - name: Verify Redis outage fails closed
