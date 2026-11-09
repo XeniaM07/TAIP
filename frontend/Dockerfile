@@ -1,11 +1,12 @@
 FROM node:22-alpine AS build
 
 WORKDIR /app
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 COPY . ./
 ARG VITE_API_URL=/api
 ENV VITE_API_URL=${VITE_API_URL}
+RUN npm test
 RUN npm run build
 
 FROM nginx:1.27-alpine

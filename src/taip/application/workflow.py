@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from threading import RLock
@@ -11,6 +12,10 @@ from time import perf_counter
 from typing import Protocol
 from uuid import uuid4
 
+from taip.ai_integration.errors import AIProviderError, AIResponseError
+from taip.common.ai_execution import (
+    AIAttempt, AICallFailure, AICallOutcome, AIExecutionPort, classify_ai_failure,
+)
 from taip.common.timetable_contracts import (
     ClassUnavailable,
     ConstraintSeverity,
@@ -45,6 +50,7 @@ from taip.common.timetable_protocols import (
 from taip.mathematical_verification.timetable_verifier import TimetableVerifier
 from taip.problem_management.repository import InMemoryProblemRepository
 from taip.problem_management.service import TimetableProblemService
+from taip.orchestration.timetable_execution import InlineAIExecution
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +75,17 @@ class WorkflowStatus(str, Enum):
 
 
 @dataclass
+class _PendingDraftEdit:
+    """Resume local port writes without regenerating commands or paid output."""
+
+    edit_id: str
+    operations: tuple[EditOperation, ...]
+    revision_started: bool
+    applied_count: int = 0
+    recorded_count: int = 0
+
+
+@dataclass
 class ModelWorkspace:
     model_id: str
     status: WorkflowStatus = WorkflowStatus.PENDING
@@ -82,9 +99,17 @@ class ModelWorkspace:
     verifications: list[TimetableVerificationResult] = field(default_factory=list)
     extraction_duration_ms: float | None = None
     solving_duration_ms: float | None = None
+    verification_duration_ms: float | None = None
+    verification_durations_ms: list[float] = field(default_factory=list)
     error: str | None = None
+    failure: AICallFailure | None = None
+    attempts: list[AIAttempt] = field(default_factory=list)
     edit_count: int = 0
     problem_management: ProblemManagementPort | None = field(default=None, repr=False, compare=False, metadata={"serialize": False})
+    _extraction_recorded: bool = field(default=False, repr=False, compare=False, metadata={"serialize": False})
+    _solution_recorded: bool = field(default=False, repr=False, compare=False, metadata={"serialize": False})
+    _verification_recorded: bool = field(default=False, repr=False, compare=False, metadata={"serialize": False})
+    _pending_edit: _PendingDraftEdit | None = field(default=None, repr=False, compare=False, metadata={"serialize": False})
 
     _TRANSITIONS = {
         WorkflowStatus.PENDING: {WorkflowStatus.EXTRACTING},
@@ -92,8 +117,8 @@ class ModelWorkspace:
         WorkflowStatus.DRAFT: {WorkflowStatus.EXTRACTING, WorkflowStatus.DRAFT, WorkflowStatus.CONFIRMED, WorkflowStatus.FAILED},
         WorkflowStatus.CONFIRMED: {WorkflowStatus.DRAFT, WorkflowStatus.SOLVING, WorkflowStatus.CONFIRMED, WorkflowStatus.FAILED},
         WorkflowStatus.SOLVING: {WorkflowStatus.COMPLETED, WorkflowStatus.FAILED},
-        WorkflowStatus.COMPLETED: {WorkflowStatus.DRAFT, WorkflowStatus.SOLVING, WorkflowStatus.EXTRACTING},
-        WorkflowStatus.FAILED: {WorkflowStatus.EXTRACTING, WorkflowStatus.CONFIRMED, WorkflowStatus.FAILED},
+        WorkflowStatus.COMPLETED: {WorkflowStatus.DRAFT, WorkflowStatus.SOLVING, WorkflowStatus.EXTRACTING, WorkflowStatus.FAILED},
+        WorkflowStatus.FAILED: {WorkflowStatus.EXTRACTING, WorkflowStatus.DRAFT, WorkflowStatus.CONFIRMED, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED},
     }
 
     def transition(self, next_status: WorkflowStatus) -> None:
@@ -237,11 +262,14 @@ class WorkflowService:
         providers: AIProviderFactoryPort,
         verifier: VerificationPort,
         benchmark_factory=None,
+        *,
+        execution: AIExecutionPort | None = None,
     ) -> None:
         self.sessions = sessions
         self.providers = providers
         self.verifier = verifier
         self.benchmark_factory = benchmark_factory
+        self.execution = execution if execution is not None else InlineAIExecution()
         self.mock_demo_prompt = ""
 
     def create_session(self, prompt: str) -> WorkSession:
@@ -268,213 +296,300 @@ class WorkflowService:
 
     def extract(self, session_id: str, model_ids: list[str] | None = None) -> WorkSession:
         session = self.sessions.get(session_id)
-        targets = model_ids or list(session.models)
-        for model_id in targets:
-            workspace = self._workspace(session, model_id)
-            if workspace.proposal is not None:
+        if model_ids is not None and (type(model_ids) is not list or any(type(item) is not str for item in model_ids)):
+            raise ValueError("Choose a list of configured models.")
+        targets = list(session.models) if not model_ids else model_ids.copy()
+        if len(set(targets)) != len(targets):
+            raise ValueError("Choose unique models.")
+        # Validate the entire request and capacity before invoking any provider.
+        workspaces = [self._workspace(session, model_id) for model_id in targets]
+        pending = [workspace for workspace in workspaces if workspace.proposal is None]
+        for workspace in pending:
+            self._ensure_attempt_capacity(workspace)
+        providers = {workspace.model_id: self.providers.get_provider(workspace.model_id) for workspace in pending}
+        for workspace in workspaces:
+            if workspace.proposal is None or not workspace._extraction_recorded or workspace.draft is None:
+                workspace.transition(WorkflowStatus.EXTRACTING)
+        outcomes = self.execution.execute("extract", {
+            model_id: lambda provider=provider: provider.extract(session.problem)
+            for model_id, provider in providers.items()
+        }) if providers else {}
+        # Only provider calls run in the executor. All state and benchmark writes stay serial.
+        for workspace in workspaces:
+            if workspace.status != WorkflowStatus.EXTRACTING:
                 continue
-            workspace.transition(WorkflowStatus.EXTRACTING)
-            started = perf_counter()
-            try:
-                proposal = self.providers.get_provider(model_id).extract(session.problem)
-                assert workspace.problem_management is not None
+            outcome = outcomes.get(workspace.model_id)
+            if outcome is not None:
+                proposal = outcome.result
+                if outcome.failure is None and (
+                    not isinstance(proposal, ExtractionProposal)
+                    or proposal.model_id != workspace.model_id
+                    or proposal.problem_id != session.problem.problem_id
+                ):
+                    outcome = self._invalid_outcome(outcome)
+                self._record_attempt(workspace, "extract", outcome)
+                workspace.extraction_duration_ms = outcome.duration_ms
+                if outcome.failure is not None:
+                    self._fail(session, workspace, outcome.failure, "extraction")
+                    continue
                 workspace.proposal = proposal
-                workspace.draft = workspace.problem_management.create_draft(proposal)
-                record_extraction = getattr(session.benchmark, "record_extraction", None)
-                if record_extraction is not None:
-                    record_extraction(
-                        session.comparison_id, proposal,
-                        round((perf_counter() - started) * 1000, 3),
-                    )
-                else:
-                    session.benchmark.record_run(
-                        session.comparison_id,
-                        ModelRunResult(model_id=model_id, proposal_id=proposal.proposal_id),
-                    )
+            try:
+                assert workspace.proposal is not None and workspace.problem_management is not None
+                if workspace.draft is None:
+                    workspace.draft = workspace.problem_management.create_draft(workspace.proposal)
+                if not workspace._extraction_recorded:
+                    record_extraction = getattr(session.benchmark, "ensure_extraction_recorded", None) or getattr(session.benchmark, "record_extraction", None)
+                    if record_extraction is not None:
+                        record_extraction(session.comparison_id, workspace.proposal, workspace.extraction_duration_ms)
+                    else:
+                        session.benchmark.record_run(session.comparison_id, ModelRunResult(
+                            model_id=workspace.model_id, proposal_id=workspace.proposal.proposal_id,
+                        ))
+                    workspace._extraction_recorded = True
                 workspace.transition(WorkflowStatus.DRAFT)
-                workspace.error = None
+                self._clear_failure(workspace)
             except Exception as error:
-                workspace.transition(WorkflowStatus.FAILED)
-                workspace.error = str(error)
-                logger.exception("session.extraction_failed session_id=%s model_id=%s", session_id, model_id)
-            workspace.extraction_duration_ms = round((perf_counter() - started) * 1000, 3)
+                self._fail(session, workspace, classify_ai_failure(error), "extraction")
         return session
 
     def edit_draft(self, session_id: str, model_id: str, data: TimetableData) -> ModelWorkspace:
         session = self.sessions.get(session_id)
         workspace = self._workspace(session, model_id)
-        if workspace.draft is None or workspace.status not in (WorkflowStatus.DRAFT, WorkflowStatus.CONFIRMED):
+        if workspace.draft is None or workspace.status not in (
+            WorkflowStatus.DRAFT, WorkflowStatus.CONFIRMED, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED,
+        ):
             raise ValueError("Extract a draft before editing it.")
         assert workspace.problem_management is not None
-        operations = self._replace_draft_data(workspace, data)
-        for operation in operations:
-            record_edit = getattr(session.benchmark, "record_edit", None)
-            if record_edit is not None:
-                record_edit(session.comparison_id, model_id, operation)
-        workspace.draft = workspace.problem_management.get_draft(workspace.draft.draft_id)
+        if workspace._pending_edit is not None:
+            self._commit_pending_edit(session, workspace)
+        operations = self._plan_draft_operations(workspace.draft.data, data)
+        if not operations:
+            return workspace
+        workspace._pending_edit = _PendingDraftEdit(
+            edit_id=str(uuid4()), operations=tuple(operations),
+            revision_started=workspace.snapshot is None,
+        )
+        # Invalidate current results before touching either local port. Immutable
+        # histories remain available even if a subsequent write needs replay.
+        workspace.snapshot = None
         workspace.solution = None
         workspace.verification = None
+        workspace.solving_duration_ms = None
+        workspace.verification_duration_ms = None
+        workspace._solution_recorded = False
+        workspace._verification_recorded = False
         workspace.transition(WorkflowStatus.DRAFT)
-        workspace.edit_count += len(operations)
+        self._commit_pending_edit(session, workspace)
         logger.info("session.draft_edited session_id=%s model_id=%s revision=%s", session_id, model_id, workspace.draft.revision)
         return workspace
+
+    def _commit_pending_edit(self, session: WorkSession, workspace: ModelWorkspace) -> None:
+        pending = workspace._pending_edit
+        assert pending is not None and workspace.problem_management is not None and workspace.draft is not None
+        try:
+            if not pending.revision_started:
+                ensure_revision = getattr(session.benchmark, "ensure_revision_started", None)
+                start_revision = getattr(session.benchmark, "start_revision", None)
+                if ensure_revision is not None:
+                    ensure_revision(session.comparison_id, workspace.model_id, pending.edit_id)
+                elif start_revision is not None:
+                    start_revision(session.comparison_id, workspace.model_id)
+                pending.revision_started = True
+            for index, operation in enumerate(pending.operations):
+                if pending.applied_count <= index:
+                    current = workspace.problem_management.get_draft(workspace.draft.draft_id)
+                    if not self._operation_already_applied(current.data, operation):
+                        workspace.problem_management.apply_edit(workspace.draft.draft_id, operation)
+                    pending.applied_count += 1
+                    workspace.edit_count += 1
+                    workspace.draft = workspace.problem_management.get_draft(workspace.draft.draft_id)
+                if pending.recorded_count <= index:
+                    record_edit = getattr(session.benchmark, "ensure_edit_recorded", None) or getattr(session.benchmark, "record_edit", None)
+                    if record_edit is not None:
+                        record_edit(session.comparison_id, workspace.model_id, operation)
+                    pending.recorded_count += 1
+            workspace._pending_edit = None
+            if workspace.status != WorkflowStatus.DRAFT:
+                workspace.transition(WorkflowStatus.DRAFT)
+            self._clear_failure(workspace)
+        except Exception as error:
+            # A port may have persisted an operation before raising. Refresh the
+            # public draft now; its planned operation is checked on explicit replay.
+            workspace.draft = workspace.problem_management.get_draft(workspace.draft.draft_id)
+            self._fail(session, workspace, classify_ai_failure(error), "draft_edit")
+            raise
 
     def confirm(self, session_id: str, model_id: str) -> ModelWorkspace:
         session = self.sessions.get(session_id)
         workspace = self._workspace(session, model_id)
         if workspace.draft is None:
             raise ValueError("Extract a draft before confirming it.")
-        if workspace.status == WorkflowStatus.CONFIRMED and workspace.snapshot is not None:
+        if workspace._pending_edit is not None:
+            raise ValueError("Retry the pending draft edit before confirming it.")
+        if workspace.snapshot is not None:
             return workspace
         if workspace.status != WorkflowStatus.DRAFT:
             raise ValueError("Only a changed draft can be confirmed.")
         assert workspace.problem_management is not None
-        workspace.snapshot = workspace.problem_management.confirm(
-            workspace.draft.draft_id, session.problem.prompt
-        )
+        workspace.snapshot = workspace.problem_management.confirm(workspace.draft.draft_id, session.problem.prompt)
         workspace.snapshots.append(workspace.snapshot)
-        workspace.solution = None
-        workspace.verification = None
         workspace.transition(WorkflowStatus.CONFIRMED)
+        self._clear_failure(workspace)
         logger.info("session.confirmed session_id=%s model_id=%s version=%s", session_id, model_id, workspace.snapshot.version)
         return workspace
 
     def solve(self, session_id: str, model_id: str) -> ModelWorkspace:
         session = self.sessions.get(session_id)
         workspace = self._workspace(session, model_id)
-        # An explicit retry reuses the already confirmed immutable snapshot.
-        # Provider cooldown/admission still applies; no automatic retry occurs.
-        if workspace.status == WorkflowStatus.FAILED and workspace.snapshot is not None:
-            workspace.transition(WorkflowStatus.CONFIRMED)
-        if workspace.snapshot is None or workspace.status != WorkflowStatus.CONFIRMED:
+        if workspace._pending_edit is not None:
+            raise ValueError("Retry the pending draft edit before solving it.")
+        if workspace.status == WorkflowStatus.COMPLETED and workspace.solution is not None:
+            return workspace
+        if workspace.snapshot is None or workspace.status not in (WorkflowStatus.CONFIRMED, WorkflowStatus.FAILED):
             raise ValueError("Confirm the draft before solving.")
+        if workspace.solution is None:
+            self._ensure_attempt_capacity(workspace)
+        if workspace.status == WorkflowStatus.FAILED:
+            workspace.transition(WorkflowStatus.CONFIRMED)
         workspace.transition(WorkflowStatus.SOLVING)
-        started = perf_counter()
         try:
-            solution = self.providers.get_provider(model_id).solve(workspace.snapshot)
-            if solution.model_id != model_id or solution.snapshot_id != workspace.snapshot.snapshot_id:
-                raise ValueError("Provider returned a solution for a different model or snapshot.")
-            record_solution = getattr(session.benchmark, "record_solution", None)
-            if record_solution is not None:
-                record_solution(
-                    session.comparison_id, solution,
-                    round((perf_counter() - started) * 1000, 3),
-                )
-            else:
-                session.benchmark.record_run(
-                    session.comparison_id,
-                    ModelRunResult(
-                        model_id=model_id,
-                        proposal_id=workspace.proposal.proposal_id if workspace.proposal else None,
-                        snapshot_id=solution.snapshot_id,
-                        solution_id=solution.solution_id,
-                        extraction_duration_ms=round(workspace.extraction_duration_ms) if workspace.extraction_duration_ms is not None else None,
-                        solving_duration_ms=round((perf_counter() - started) * 1000),
-                        edit_count=workspace.edit_count,
-                    ),
-                )
-            workspace.solution = solution
-            workspace.solutions.append(solution)
+            if workspace.solution is None:
+                provider = self.providers.get_provider(model_id)
+                snapshot = workspace.snapshot
+                outcome = self.execution.execute("solve", {model_id: lambda: provider.solve(snapshot)})[model_id]
+                solution = outcome.result
+                if outcome.failure is None and (
+                    not isinstance(solution, TimetableSolution)
+                    or solution.model_id != model_id or solution.snapshot_id != snapshot.snapshot_id
+                ):
+                    outcome = self._invalid_outcome(outcome)
+                self._record_attempt(workspace, "solve", outcome)
+                workspace.solving_duration_ms = outcome.duration_ms
+                if outcome.failure is not None:
+                    self._fail(session, workspace, outcome.failure, "solve")
+                    if outcome.exception is not None:
+                        raise outcome.exception
+                    raise AIProviderError(outcome.failure.code, retry_after_seconds=outcome.failure.retry_after_seconds)
+                # Preserve paid output before any local operation can fail.
+                workspace.solution = solution
+                workspace.solutions.append(solution)
+            if not workspace._solution_recorded:
+                record_solution = getattr(session.benchmark, "ensure_solution_recorded", None) or getattr(session.benchmark, "record_solution", None)
+                if record_solution is not None:
+                    record_solution(session.comparison_id, workspace.solution, workspace.solving_duration_ms or 0)
+                else:
+                    session.benchmark.record_run(session.comparison_id, self._summary(workspace))
+                workspace._solution_recorded = True
             workspace.transition(WorkflowStatus.COMPLETED)
-            workspace.error = None
+            self._clear_failure(workspace)
         except Exception as error:
-            workspace.transition(WorkflowStatus.FAILED)
-            workspace.error = str(error)
-            logger.exception("session.solve_failed session_id=%s model_id=%s", session_id, model_id)
+            if workspace.status != WorkflowStatus.FAILED:
+                self._fail(session, workspace, classify_ai_failure(error), "solve")
             raise
-        finally:
-            workspace.solving_duration_ms = round((perf_counter() - started) * 1000, 3)
         return workspace
 
     def verify(self, session_id: str, model_id: str) -> ModelWorkspace:
         session = self.sessions.get(session_id)
         workspace = self._workspace(session, model_id)
-        if workspace.snapshot is None or workspace.solution is None:
+        if workspace.snapshot is None or workspace.solution is None or not workspace._solution_recorded:
             raise ValueError("Solve the confirmed draft before verification.")
-        if workspace.verification is not None:
+        if workspace.verification is not None and workspace._verification_recorded:
             return workspace
-        started = perf_counter()
-        result = self.verifier.verify(workspace.snapshot, workspace.solution)
-        duration_ms = round((perf_counter() - started) * 1000, 3)
-        record_verification = getattr(session.benchmark, "record_verification", None)
-        if record_verification is not None:
-            record_verification(
-                session.comparison_id, model_id, result, duration_ms=duration_ms
-            )
-        elif isinstance(session.benchmark, NoOpBenchmark):
-            session.benchmark.record_run(
-                session.comparison_id,
-                ModelRunResult(
-                    model_id=model_id,
-                    proposal_id=workspace.proposal.proposal_id if workspace.proposal else None,
-                    snapshot_id=result.snapshot_id,
-                    solution_id=result.solution_id,
-                    verification_status=result.status,
-                    extraction_duration_ms=round(workspace.extraction_duration_ms) if workspace.extraction_duration_ms is not None else None,
-                    solving_duration_ms=round(workspace.solving_duration_ms) if workspace.solving_duration_ms is not None else None,
-                    edit_count=workspace.edit_count,
-                ),
-            )
-        workspace.verification = result
-        workspace.verifications.append(result)
+        try:
+            if workspace.verification is None:
+                started = perf_counter()
+                workspace.verification = self.verifier.verify(workspace.snapshot, workspace.solution)
+                workspace.verification_duration_ms = round((perf_counter() - started) * 1000, 3)
+                workspace.verifications.append(workspace.verification)
+                workspace.verification_durations_ms.append(workspace.verification_duration_ms)
+            result = workspace.verification
+            duration_ms = workspace.verification_duration_ms
+            record_verification = getattr(session.benchmark, "ensure_verification_recorded", None) or getattr(session.benchmark, "record_verification", None)
+            if record_verification is not None:
+                record_verification(session.comparison_id, model_id, result, duration_ms=duration_ms)
+            elif isinstance(session.benchmark, NoOpBenchmark):
+                session.benchmark.record_run(session.comparison_id, self._summary(workspace))
+            workspace._verification_recorded = True
+            if workspace.status == WorkflowStatus.FAILED:
+                workspace.transition(WorkflowStatus.COMPLETED)
+            self._clear_failure(workspace)
+        except Exception as error:
+            self._fail(session, workspace, classify_ai_failure(error), "verification")
+            raise
         logger.info("session.verified session_id=%s model_id=%s status=%s", session_id, model_id, result.status.value)
         return workspace
 
     def compare(self, session_id: str) -> ComparisonRun:
         session = self.sessions.get(session_id)
-        if getattr(session.benchmark, "compare_runs", None) is not None:
-            return session.benchmark.compare(session.comparison_id, session.problem.problem_id)
-        if getattr(session.benchmark, "record_extraction", None) is None:
-            comparison = session.benchmark.compare(session.comparison_id, session.problem.problem_id)
-            existing = {item.model_id: item for item in comparison.model_runs}
-            summaries = []
-            for model_id, workspace in session.models.items():
-                current = existing.get(model_id)
-                if current is not None and current.proposal_id is not None:
-                    summaries.append(current)
-                elif workspace.proposal is not None:
-                    summaries.append(ModelRunResult(
-                        model_id=model_id,
-                        proposal_id=workspace.proposal.proposal_id,
-                        snapshot_id=workspace.verification.snapshot_id if workspace.verification else workspace.snapshot.snapshot_id if workspace.snapshot else None,
-                        solution_id=workspace.verification.solution_id if workspace.verification else workspace.solution.solution_id if workspace.solution else None,
-                        verification_status=workspace.verification.status if workspace.verification else None,
-                        extraction_duration_ms=round(workspace.extraction_duration_ms) if workspace.extraction_duration_ms is not None else None,
-                        solving_duration_ms=round(workspace.solving_duration_ms) if workspace.solving_duration_ms is not None else None,
-                        edit_count=workspace.edit_count,
-                        error=workspace.error,
-                    ))
-                else:
-                    summaries.append(ModelRunResult(model_id=model_id))
-            return ComparisonRun(comparison.comparison_id, comparison.problem_id, tuple(summaries))
         comparison = session.benchmark.compare(session.comparison_id, session.problem.problem_id)
         existing = {item.model_id: item for item in comparison.model_runs}
-        summaries = tuple(
-            existing.get(model_id)
-            or ModelRunResult(
-                model_id=model_id,
-                proposal_id=workspace.proposal.proposal_id if workspace.proposal else None,
-                snapshot_id=workspace.verification.snapshot_id if workspace.verification else workspace.solution.snapshot_id if workspace.solution else None,
-                solution_id=workspace.verification.solution_id if workspace.verification else workspace.solution.solution_id if workspace.solution else None,
-                verification_status=workspace.verification.status if workspace.verification else None,
-                extraction_duration_ms=round(workspace.extraction_duration_ms) if workspace.extraction_duration_ms is not None else None,
-                solving_duration_ms=round(workspace.solving_duration_ms) if workspace.solving_duration_ms is not None else None,
-                edit_count=workspace.edit_count,
-                error=workspace.error,
-            )
-            for model_id, workspace in session.models.items()
-        )
-        return ComparisonRun(comparison.comparison_id, comparison.problem_id, summaries)
+        # Merge every workspace into the benchmark's metrics, including failed and pending models.
+        summaries = []
+        for model_id, workspace in session.models.items():
+            summary = self._summary(workspace)
+            current = existing.get(model_id)
+            if current is not None:
+                summary = replace(current, **{
+                    name: getattr(summary, name)
+                    for name in ("proposal_id", "snapshot_id", "solution_id", "verification_status", "error", "edit_count", "solving_duration_ms")
+                })
+            summaries.append(summary)
+        return ComparisonRun(comparison.comparison_id, comparison.problem_id, tuple(summaries))
 
     def comparison_report(self, session_id: str):
         """Detailed reporting is an optional capability beyond the shared benchmark port."""
         session = self.sessions.get(session_id)
         compare_runs = getattr(session.benchmark, "compare_runs", None)
-        if compare_runs is None:
-            return None
-        if compare_runs is None:
-            return None
-        return compare_runs(session.comparison_id, session.problem.problem_id)
+        return compare_runs(session.comparison_id, session.problem.problem_id) if compare_runs is not None else None
+
+    @staticmethod
+    def _summary(workspace: ModelWorkspace) -> ModelRunResult:
+        return ModelRunResult(
+            model_id=workspace.model_id,
+            proposal_id=workspace.proposal.proposal_id if workspace.proposal else None,
+            snapshot_id=workspace.snapshot.snapshot_id if workspace.snapshot else None,
+            solution_id=workspace.solution.solution_id if workspace.solution else None,
+            verification_status=workspace.verification.status if workspace.verification else None,
+            extraction_duration_ms=round(workspace.extraction_duration_ms) if workspace.extraction_duration_ms is not None else None,
+            solving_duration_ms=round(workspace.solving_duration_ms) if workspace.solving_duration_ms is not None else None,
+            edit_count=workspace.edit_count, error=workspace.error,
+        )
+
+    @staticmethod
+    def _record_attempt(workspace: ModelWorkspace, operation: str, outcome: AICallOutcome) -> None:
+        if not getattr(outcome, "attempted", True):
+            return
+        workspace.attempts.append(AIAttempt(
+            attempt_id=str(uuid4()), operation=operation, model_id=workspace.model_id,
+            snapshot_id=workspace.snapshot.snapshot_id if operation == "solve" and workspace.snapshot else None,
+            duration_ms=outcome.duration_ms, failure=outcome.failure,
+            invocation=outcome.invocation, raw_response=outcome.raw_response,
+        ))
+
+    @staticmethod
+    def _ensure_attempt_capacity(workspace: ModelWorkspace) -> None:
+        if len(workspace.attempts) >= 100:
+            raise ValueError("This model has reached the session limit of 100 AI attempts. Create a new session.")
+
+    @staticmethod
+    def _invalid_outcome(outcome: AICallOutcome) -> AICallOutcome:
+        message = "The AI response does not match the requested workflow."
+        return replace(
+            outcome, failure=AICallFailure("invalid_response", message),
+            exception=AIResponseError("invalid_response", "$", message),
+        )
+
+    @staticmethod
+    def _clear_failure(workspace: ModelWorkspace) -> None:
+        workspace.error = None
+        workspace.failure = None
+
+    @staticmethod
+    def _fail(session: WorkSession, workspace: ModelWorkspace, failure: AICallFailure, operation: str) -> None:
+        workspace.transition(WorkflowStatus.FAILED)
+        workspace.failure = failure
+        workspace.error = failure.message
+        logger.error("session.%s_failed session_id=%s model_id=%s code=%s", operation, session.session_id, workspace.model_id, failure.code)
 
     @staticmethod
     def _workspace(session: WorkSession, model_id: str) -> ModelWorkspace:
@@ -483,53 +598,51 @@ class WorkflowService:
         except KeyError as error:
             raise KeyError(f"Unknown model '{model_id}'.") from error
 
+    _EDIT_COLLECTIONS = {
+        "class": ("classes", "class_id"),
+        "teacher": ("teachers", "teacher_id"),
+        "subject": ("subjects", "subject_id"),
+        "room": ("rooms", "room_id"),
+        "time_slot": ("time_slots", "slot_id"),
+        "requirement": ("requirements", "requirement_id"),
+        "constraint": ("constraints", "constraint_id"),
+    }
+
     @staticmethod
-    def _replace_draft_data(workspace: ModelWorkspace, data: TimetableData) -> list[EditOperation]:
-        """Apply editor changes through the problem-management port."""
-        assert workspace.draft is not None and workspace.problem_management is not None
-        from dataclasses import asdict
-        import json
+    def _encode_entity(entity) -> str:
+        def normalize(value):
+            if hasattr(value, "value"):
+                return value.value
+            if isinstance(value, dict):
+                return {key: normalize(item) for key, item in value.items()}
+            if isinstance(value, (tuple, list)):
+                return [normalize(item) for item in value]
+            return value
+        return json.dumps(normalize(asdict(entity)))
 
-        current = workspace.draft.data
-        collections = {
-            "class": (current.classes, data.classes, "class_id"),
-            "teacher": (current.teachers, data.teachers, "teacher_id"),
-            "subject": (current.subjects, data.subjects, "subject_id"),
-            "room": (current.rooms, data.rooms, "room_id"),
-            "time_slot": (current.time_slots, data.time_slots, "slot_id"),
-            "requirement": (current.requirements, data.requirements, "requirement_id"),
-            "constraint": (current.constraints, data.constraints, "constraint_id"),
-        }
+    @classmethod
+    def _operation_already_applied(cls, data: TimetableData, operation: EditOperation) -> bool:
+        collection, id_field = cls._EDIT_COLLECTIONS[operation.entity_type]
+        entity = next((item for item in getattr(data, collection) if getattr(item, id_field) == operation.entity_id), None)
+        if operation.action == "remove":
+            return entity is None
+        return entity is not None and cls._encode_entity(entity) == operation.after_json
 
-        def encoded(entity) -> str:
-            def normalize(value):
-                if hasattr(value, "value"):
-                    return value.value
-                if isinstance(value, dict):
-                    return {key: normalize(item) for key, item in value.items()}
-                if isinstance(value, (tuple, list)):
-                    return [normalize(item) for item in value]
-                return value
-            return json.dumps(normalize(asdict(entity)))
-
+    @classmethod
+    def _plan_draft_operations(cls, current: TimetableData, data: TimetableData) -> list[EditOperation]:
+        """Create stable, replayable commands without mutating either local port."""
         operations: list[EditOperation] = []
-        for entity_type, (before, after, id_field) in collections.items():
-            before_by_id = {getattr(item, id_field): item for item in before}
-            after_by_id = {getattr(item, id_field): item for item in after}
+        for entity_type, (collection, id_field) in cls._EDIT_COLLECTIONS.items():
+            before_by_id = {getattr(item, id_field): item for item in getattr(current, collection)}
+            after_by_id = {getattr(item, id_field): item for item in getattr(data, collection)}
             for entity_id, old in before_by_id.items():
                 if entity_id not in after_by_id:
-                    operation = EditOperation(str(uuid4()), entity_type, entity_id, "remove", encoded(old), None)
-                    workspace.problem_management.apply_edit(workspace.draft.draft_id, operation)
-                    operations.append(operation)
+                    operations.append(EditOperation(str(uuid4()), entity_type, entity_id, "remove", cls._encode_entity(old), None))
                 elif old != after_by_id[entity_id]:
-                    operation = EditOperation(str(uuid4()), entity_type, entity_id, "update", encoded(old), encoded(after_by_id[entity_id]))
-                    workspace.problem_management.apply_edit(workspace.draft.draft_id, operation)
-                    operations.append(operation)
+                    operations.append(EditOperation(str(uuid4()), entity_type, entity_id, "update", cls._encode_entity(old), cls._encode_entity(after_by_id[entity_id])))
             for entity_id, new in after_by_id.items():
                 if entity_id not in before_by_id:
-                    operation = EditOperation(str(uuid4()), entity_type, entity_id, "add", None, encoded(new))
-                    workspace.problem_management.apply_edit(workspace.draft.draft_id, operation)
-                    operations.append(operation)
+                    operations.append(EditOperation(str(uuid4()), entity_type, entity_id, "add", None, cls._encode_entity(new)))
         return operations
 
 

@@ -19,9 +19,11 @@ ALLOWED_DEPENDENCIES = {
     },
     "application": {
         "application",
+        "ai_integration",
         "common",
         "mathematical_verification",
         "problem_management",
+        "orchestration",
     },
 }
 

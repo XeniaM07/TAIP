@@ -4,44 +4,37 @@ from __future__ import annotations
 
 from dataclasses import fields, is_dataclass
 from enum import Enum
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-
+from taip.ai_integration.errors import AIProviderError, AIResponseError
+from taip.ai_integration.response_codec import decode_timetable_data
+from taip.application.session_guard import SessionOperationGuard
 from taip.application.workflow import (
     WorkflowService,
     WorkflowStatus,
     build_default_service,
 )
-from taip.common.timetable_contracts import (
-    BalanceClassDailyLoad,
-    ClassUnavailable,
-    ConstraintSeverity,
-    ConstraintType,
-    MaxClassPeriodsPerDay,
-    MinimizeClassGaps,
-    MinimizeTeacherGaps,
-    RoomFeatureRequired,
-    RoomUnavailable,
-    TeacherPreferredSlots,
-    TeacherUnavailable,
-    TimetableConstraint,
-    TimetableData,
-    Weekday,
-    Room,
-    SchoolClass,
-    Subject,
-    Teacher,
-    TeachingRequirement,
-    TimeSlot,
-)
+from taip.common.timetable_contracts import TimetableData
 
 
 class CreateSessionRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=20_000)
+
+    @field_validator("prompt")
+    @classmethod
+    def bounded_prompt(cls, value: str) -> str:
+        try:
+            valid = len(value.encode("utf-8")) <= 16384
+        except UnicodeError:
+            valid = False
+        if not valid:
+            raise ValueError("Prompt exceeds the supported UTF-8 byte limit.")
+        return value
 
 
 class ExtractRequest(BaseModel):
@@ -69,38 +62,7 @@ def _json(value: Any) -> Any:
 
 
 def _data_from_json(raw: dict[str, Any]) -> TimetableData:
-    params_by_type = {
-        ConstraintType.TEACHER_UNAVAILABLE: TeacherUnavailable,
-        ConstraintType.ROOM_UNAVAILABLE: RoomUnavailable,
-        ConstraintType.CLASS_UNAVAILABLE: ClassUnavailable,
-        ConstraintType.ROOM_FEATURE_REQUIRED: RoomFeatureRequired,
-        ConstraintType.MAX_CLASS_PERIODS_PER_DAY: MaxClassPeriodsPerDay,
-        ConstraintType.TEACHER_PREFERRED_SLOTS: TeacherPreferredSlots,
-        ConstraintType.MINIMIZE_TEACHER_GAPS: MinimizeTeacherGaps,
-        ConstraintType.MINIMIZE_CLASS_GAPS: MinimizeClassGaps,
-        ConstraintType.BALANCE_CLASS_DAILY_LOAD: BalanceClassDailyLoad,
-    }
-    constraints = []
-    for item in raw.get("constraints", []):
-        kind = ConstraintType(item["type"])
-        params = dict(item["parameters"])
-        if "slot_ids" in params:
-            params["slot_ids"] = tuple(params["slot_ids"])
-        constraints.append(TimetableConstraint(
-            constraint_id=item["constraint_id"], type=kind,
-            severity=ConstraintSeverity(item.get("severity", "hard")),
-            parameters=params_by_type[kind](**params),
-            weight=item.get("weight", 1), source_text=item.get("source_text"),
-        ))
-    return TimetableData(
-        classes=tuple(SchoolClass(**item) for item in raw.get("classes", [])),
-        teachers=tuple(Teacher(**{**item, "subject_ids": tuple(item.get("subject_ids", []))}) for item in raw.get("teachers", [])),
-        subjects=tuple(Subject(**item) for item in raw.get("subjects", [])),
-        rooms=tuple(Room(**{**item, "features": tuple(item.get("features", []))}) for item in raw.get("rooms", [])),
-        time_slots=tuple(TimeSlot(**{**item, "day": Weekday(item["day"])}) for item in raw.get("time_slots", [])),
-        requirements=tuple(TeachingRequirement(**item) for item in raw.get("requirements", [])),
-        constraints=tuple(constraints),
-    )
+    return decode_timetable_data(raw)
 
 
 def _default_benchmark_factory(session_id: str):
@@ -110,16 +72,25 @@ def _default_benchmark_factory(session_id: str):
     return service_type(session_id)
 
 
-def create_app(service: WorkflowService | None = None) -> FastAPI:
+def create_app(
+    service: WorkflowService | None = None, *,
+    runtime_info: Callable[[], dict[str, Any]] | None = None,
+) -> FastAPI:
     workflow = service or build_default_service()
     if workflow.benchmark_factory is None:
         workflow.benchmark_factory = _default_benchmark_factory
     app = FastAPI(title="TAIP", version="0.1.0", description="Mockable end-to-end timetable workflow API")
     app.state.workflow = workflow
+    if runtime_info is None:
+        from taip.application.runtime import runtime_info_for_service
+
+        runtime_info = lambda: runtime_info_for_service(workflow)
+    app.state.runtime_info = runtime_info
     app.add_middleware(
         CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
         allow_credentials=False, allow_methods=["*"], allow_headers=["*"],
     )
+    app.add_middleware(SessionOperationGuard, workflow=workflow)
 
     def get_session(session_id: str):
         try:
@@ -130,18 +101,46 @@ def create_app(service: WorkflowService | None = None) -> FastAPI:
     def run(action, *args):
         try:
             return action(*args)
+        except (AIProviderError, AIResponseError):
+            raise
         except KeyError as error:
             raise HTTPException(404, str(error)) from error
         except (ValueError, TypeError, KeyError) as error:
             raise HTTPException(400, str(error)) from error
 
+    def mutate(action, session_id: str, model_id: str, session_view: bool, *args):
+        workspace = run(workflow._workspace, get_session(session_id), model_id)
+        previous_failure = workspace.failure
+        try:
+            workspace = run(action, session_id, model_id, *args)
+        except (AIProviderError, AIResponseError):
+            # The facade retains the failed workspace before preserving the
+            # typed exception for non-HTTP callers. Return its current state.
+            pass
+        except HTTPException:
+            if (workspace.failure is not previous_failure and workspace.failure is not None
+                    and workspace.failure.code == "unexpected_error"):
+                # A provider/local bug can use ValueError or KeyError too;
+                # newly recorded failure context distinguishes it from user
+                # validation and prevents arbitrary exception text escaping.
+                raise HTTPException(500, "Internal server error.") from None
+            raise
+        return _session_json(get_session(session_id)) if session_view else _json(workspace)
+
     @app.get("/api/health")
     def health():
         return {"status": "ok"}
 
+    @app.get("/api/runtime")
+    def runtime_state():
+        return runtime_info()
+
     @app.get("/api/mock/demo-prompt")
     def mock_demo_prompt():
-        return {"prompt": workflow.mock_demo_prompt}
+        info = runtime_info()
+        if info["mode"] != "mock" or info["demo_prompt"] is None:
+            raise HTTPException(404, "Mock demonstration is unavailable in this runtime.")
+        return {"prompt": info["demo_prompt"]}
 
     @app.post("/api/sessions", status_code=201)
     def create_session(request: CreateSessionRequest):
@@ -166,30 +165,26 @@ def create_app(service: WorkflowService | None = None) -> FastAPI:
         return _json(workspace.draft)
 
     @app.patch("/api/sessions/{session_id}/drafts/{model_id}")
-    def edit_draft(session_id: str, model_id: str, request: EditDraftRequest):
+    def edit_draft(session_id: str, model_id: str, request: EditDraftRequest, session_view: bool = False):
         try:
             data = _data_from_json(request.data)
-            workspace = workflow.edit_draft(session_id, model_id, data)
-            return _json(workspace)
+            return mutate(workflow.edit_draft, session_id, model_id, session_view, data)
         except KeyError as error:
             raise HTTPException(404, str(error)) from error
         except (ValueError, TypeError, KeyError) as error:
             raise HTTPException(400, str(error)) from error
 
     @app.post("/api/sessions/{session_id}/models/{model_id}/confirm")
-    def confirm(session_id: str, model_id: str):
-        workspace = run(workflow.confirm, session_id, model_id)
-        return _json(workspace)
+    def confirm(session_id: str, model_id: str, session_view: bool = False):
+        return mutate(workflow.confirm, session_id, model_id, session_view)
 
     @app.post("/api/sessions/{session_id}/models/{model_id}/solve")
-    def solve(session_id: str, model_id: str):
-        workspace = run(workflow.solve, session_id, model_id)
-        return _json(workspace)
+    def solve(session_id: str, model_id: str, session_view: bool = False):
+        return mutate(workflow.solve, session_id, model_id, session_view)
 
     @app.post("/api/sessions/{session_id}/models/{model_id}/verify")
-    def verify(session_id: str, model_id: str):
-        workspace = run(workflow.verify, session_id, model_id)
-        return _json(workspace)
+    def verify(session_id: str, model_id: str, session_view: bool = False):
+        return mutate(workflow.verify, session_id, model_id, session_view)
 
     @app.get("/api/sessions/{session_id}/compare")
     def compare(session_id: str):
@@ -216,26 +211,25 @@ def create_app(service: WorkflowService | None = None) -> FastAPI:
 
 def _session_json(session) -> dict[str, Any]:
     states = [workspace.status for workspace in session.models.values()]
-    if WorkflowStatus.FAILED in states:
-        status = WorkflowStatus.FAILED
-    elif WorkflowStatus.SOLVING in states:
-        status = WorkflowStatus.SOLVING
+    if WorkflowStatus.SOLVING in states:
+        status = "SOLVING"
     elif WorkflowStatus.EXTRACTING in states:
-        status = WorkflowStatus.EXTRACTING
-    elif all(state == WorkflowStatus.COMPLETED for state in states):
-        status = WorkflowStatus.COMPLETED
-    elif all(state in (WorkflowStatus.DRAFT, WorkflowStatus.CONFIRMED, WorkflowStatus.COMPLETED) for state in states) and any(state == WorkflowStatus.DRAFT for state in states):
-        status = WorkflowStatus.DRAFT
-    elif all(state in (WorkflowStatus.CONFIRMED, WorkflowStatus.COMPLETED) for state in states) and any(state == WorkflowStatus.CONFIRMED for state in states):
-        status = WorkflowStatus.CONFIRMED
-    elif any(state == WorkflowStatus.COMPLETED for state in states):
-        status = WorkflowStatus.COMPLETED
+        status = "EXTRACTING"
+    elif WorkflowStatus.FAILED in states:
+        status = "FAILED" if all(state == WorkflowStatus.FAILED for state in states) else "PARTIAL"
     else:
-        status = WorkflowStatus.PENDING
+        # The least advanced workspace determines the remaining session work.
+        status = next((state.value for state in (
+            WorkflowStatus.PENDING, WorkflowStatus.DRAFT,
+            WorkflowStatus.CONFIRMED, WorkflowStatus.COMPLETED,
+        ) if state in states), "PENDING")
     return {
         "session_id": session.session_id,
         "problem": _json(session.problem),
-        "status": status.value,
+        "status": status,
+        "progress": {"total": len(states), **{
+            state.value.lower(): states.count(state) for state in WorkflowStatus
+        }},
         "created_at": session.created_at.isoformat(),
         "last_accessed_at": session.last_accessed_at.isoformat(),
         "models": {model_id: _json(workspace) for model_id, workspace in session.models.items()},

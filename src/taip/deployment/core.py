@@ -1,23 +1,20 @@
 """Private, single-owner workflow composition behind the distributed gateway."""
 
 import asyncio
-from collections import deque
 from hashlib import sha256
 from uuid import UUID
 
 from taip.ai_integration.config import load_provider_configs
 from taip.ai_integration.errors import AIResponseError
-from taip.ai_integration.factory import AIProviderFactory
-from taip.ai_integration.http_transport import HTTPJSONTransport
 from taip.ai_integration.rate_limits import RateLimitPort
 from taip.ai_integration.request_guard import validate_source_prompt
 from taip.application.api import create_app
-from taip.application.workflow import InMemorySessionRepository, WorkflowService, build_default_service
+from taip.application.workflow import WorkflowService
+from taip.application.runtime import build_runtime
 from taip.deployment import asgi
 from taip.deployment.auth import CredentialVerifier
 from taip.deployment.redis_limits import RedisRateLimiter
 from taip.deployment.settings import DeploymentConfigurationError, DeploymentSettings, load_deployment_settings
-from taip.mathematical_verification.timetable_verifier import TimetableVerifier
 
 
 class ProtectedCore:
@@ -28,8 +25,8 @@ class ProtectedCore:
     Redis stores admission and ownership metadata, never workflow sessions.
     """
 
-    def __init__(self, service, settings, redis_client, owner, *, owned_client=False, transport=None, invocations=None):
-        self.inner = create_app(service)
+    def __init__(self, service, settings, redis_client, owner, *, owned_client=False, transport=None, invocations=None, runtime=None):
+        self.inner = create_app(service, runtime_info=runtime.runtime_info if runtime else None)
         self.state = self.inner.state
         self.settings = settings
         self._client = redis_client
@@ -37,6 +34,7 @@ class ProtectedCore:
         self._owned_client = owned_client
         self._transport = transport
         self._invocations = invocations
+        self._runtime = runtime
         self._closed = False
         self._startup_failed = False
         self._active_sessions: set[str] = set()
@@ -246,7 +244,8 @@ class ProtectedCore:
         if self._closed:
             return
         self._closed = True
-        for resource in (self._owner, self._transport, self._client if self._owned_client else None):
+        for resource in (self._owner, self._runtime if self._runtime else self._transport,
+                         self._client if self._owned_client else None):
             if resource is not None:
                 try:
                     resource.close()
@@ -268,6 +267,7 @@ def create_core_app(
         redis_client = create_redis_client(settings.redis)
     transport = None
     invocations = None
+    runtime = None
     try:
         if owner is None:
             from taip.deployment.ownership import CoreOwnershipLease
@@ -275,20 +275,24 @@ def create_core_app(
         if service is None:
             if settings.live_ai:
                 configs = load_provider_configs()
-                if settings.redis_lease_seconds <= 4 * max(config.timeout_seconds for config in configs) + 10:
+                operation_bound = 4 * max(config.timeout_seconds for config in configs)
+                if settings.redis_lease_seconds <= operation_bound + 10:
                     raise DeploymentConfigurationError("redis_lease_seconds")
+                if settings.request_timeout_seconds <= operation_bound + 20:
+                    raise DeploymentConfigurationError("request_timeout_seconds")
                 shared_limiter = limiter if limiter is not None else RedisRateLimiter(
                     redis_client, namespace=settings.redis.namespace + ":providers", lease_seconds=settings.redis_lease_seconds
                 )
-                invocations = deque(maxlen=100)
-                transport = HTTPJSONTransport()
-                factory = AIProviderFactory(configs, transport=transport, observer=invocations.append, limiter=shared_limiter)
-                service = WorkflowService(InMemorySessionRepository(), factory, TimetableVerifier())
+                runtime = build_runtime(configs, limiter=shared_limiter)
             else:
-                service = build_default_service()
+                runtime = build_runtime()
+            service = runtime.workflow
+            invocations = runtime.invocations
         return ProtectedCore(service, settings, redis_client, owner, owned_client=owned_client,
-                             transport=transport, invocations=invocations)
+                             transport=transport, invocations=invocations, runtime=runtime)
     except Exception:
+        if runtime is not None:
+            runtime.close()
         if transport is not None:
             transport.close()
         if owned_client:

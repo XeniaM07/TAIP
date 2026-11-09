@@ -9,6 +9,7 @@ class InMemoryBenchmarkRepository:
 
     def __init__(self) -> None:
         self._runs: dict[tuple[str, str, str], TimetableRunRecord] = {}
+        self._run_history: dict[tuple[str, str, str], list[TimetableRunRecord]] = {}
         self._legacy_runs: dict[tuple[str, str, str], ModelRunResult] = {}
 
     def save_run(self, record: TimetableRunRecord) -> None:
@@ -19,6 +20,16 @@ class InMemoryBenchmarkRepository:
         self, session_id: str, comparison_id: str, model_id: str
     ) -> TimetableRunRecord:
         return self._runs[(session_id, comparison_id, model_id)]
+
+    def archive_run(self, record: TimetableRunRecord) -> None:
+        """Retain an immutable previous revision before replacing the current run."""
+        key = (record.session_id, record.comparison_id, record.model_id)
+        self._run_history.setdefault(key, []).append(record)
+
+    def list_run_history(
+        self, session_id: str, comparison_id: str, model_id: str
+    ) -> tuple[TimetableRunRecord, ...]:
+        return tuple(self._run_history.get((session_id, comparison_id, model_id), ()))
 
     def list_runs(
         self,

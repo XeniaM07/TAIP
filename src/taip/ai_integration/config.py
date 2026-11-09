@@ -6,6 +6,8 @@ from enum import Enum
 from hashlib import sha256
 import math
 import os
+from pathlib import Path
+import stat
 
 from taip.ai_integration.errors import AIConfigurationError
 from taip.ai_integration.rate_limits import RateLimitPolicy
@@ -120,8 +122,9 @@ def load_provider_configs(
 ) -> tuple[ProviderConfig, ...]:
     """Load all three providers from a supplied mapping or the current environment.
 
-    Every model slug and credential is required. No file is opened, no dotenv
-    state is merged, and an explicit mapping is used without environment fallbacks.
+    Every model slug and credential is required. A credential is supplied inline
+    or through an explicit *_API_KEY_FILE, never both. No dotenv state is merged;
+    an explicit mapping never falls back to the ambient environment.
     """
     source = os.environ if environment is None else environment
     controls = {
@@ -145,7 +148,26 @@ def load_provider_configs(
     configs = []
     for provider in ProviderKind:
         prefix = provider.value.upper()
-        api_key = _require_string(source.get(f"{prefix}_API_KEY"), f"{prefix}_API_KEY")
+        key_name, file_name = f"{prefix}_API_KEY", f"{prefix}_API_KEY_FILE"
+        if file_name in source:
+            if key_name in source:
+                raise AIConfigurationError(file_name)
+            path = _require_string(source[file_name], file_name)
+            try:
+                secret_path = Path(path)
+                if not stat.S_ISREG(secret_path.stat().st_mode):
+                    raise ValueError
+                with secret_path.open("rb") as stream:
+                    if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                        raise ValueError
+                    content = stream.read(4097)
+                if len(content) > 4096:
+                    raise ValueError
+                api_key = _require_string(content.decode("utf-8").rstrip("\r\n"), file_name)
+            except (OSError, ValueError, UnicodeError):
+                raise AIConfigurationError(file_name) from None
+        else:
+            api_key = _require_string(source.get(key_name), key_name)
         api_model_id = _require_string(source.get(f"{prefix}_MODEL"), f"{prefix}_MODEL")
         use_json_schema = _schema_option(source, f"{prefix}_JSON_SCHEMA")
         rate_limits = _rate_policy(source, prefix)

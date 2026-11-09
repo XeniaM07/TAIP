@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
+from dataclasses import asdict
 from types import MappingProxyType
 from typing import ClassVar
 
@@ -87,7 +88,7 @@ class AIProviderFactory:
     exposes safe counters and the callback receives typed warning events.
     """
 
-    __slots__ = ("_providers", "_model_ids", "_limiter", "_quota_keys")
+    __slots__ = ("_providers", "_model_ids", "_limiter", "_quota_keys", "_catalog")
 
     def __init__(
         self, configs: Iterable[ProviderConfig], *, transport: JSONTransport,
@@ -104,6 +105,7 @@ class AIProviderFactory:
         creators: dict[str, TimetableAdapterCreator] = {}
         policies = {}
         quota_keys = {}
+        catalog = []
         for config in configuration_iterator:
             if not isinstance(config, ProviderConfig):
                 raise AIConfigurationError("config")
@@ -117,6 +119,13 @@ class AIProviderFactory:
             creators[config.model_id] = _CREATOR_TYPES[config.provider](
                 config, transport, observer=observer, limiter=self._limiter,
             )
+            catalog.append({
+                "model_id": config.model_id,
+                "label": f"{config.provider.value.title()} · {config.api_model_id}",
+                "provider": config.provider.value,
+                "requested_model_id": config.api_model_id,
+                "limits": asdict(config.rate_limits),
+            })
         if not creators:
             raise AIConfigurationError("providers")
         self._providers = MappingProxyType({
@@ -124,6 +133,11 @@ class AIProviderFactory:
         })
         self._model_ids = tuple(self._providers)
         self._quota_keys = MappingProxyType(quota_keys)
+        self._catalog = tuple(catalog)
+
+    def model_catalog(self) -> tuple[dict[str, object], ...]:
+        """Return copied public configuration fields without credentials."""
+        return tuple({**model, "limits": dict(model["limits"])} for model in self._catalog)
 
     @property
     def MODEL_IDS(self) -> tuple[str, ...]:
