@@ -9,6 +9,7 @@ from time import perf_counter
 from typing import Literal
 
 from taip.ai_integration.monitoring import InvocationRecord, observe_invocations
+from taip.ai_integration.settlement import SettlementPendingError
 from taip.common.ai_execution import AICallFailure, AICallOutcome, classify_ai_failure
 
 
@@ -18,6 +19,7 @@ def _summary(record: InvocationRecord) -> dict[str, object]:
             "returned_model_id": record.returned_model_id, "upstream_provider": record.upstream_provider,
             "duration_ms": record.duration_ms, "outcome": record.outcome, "error_code": record.error_code,
             "http_status_code": record.http_status_code, "retry_after_seconds": record.retry_after_seconds,
+            "settlement_pending": record.settlement_pending, "settlement_warning": record.settlement_warning,
             "generation_parameters": asdict(record.generation_parameters) if record.generation_parameters else None,
             "usage": asdict(record.usage) if record.usage else None}
 
@@ -36,8 +38,11 @@ def _call(operation: str, call: Callable[[], object]) -> AICallOutcome:
     raw = record.raw_response if record else getattr(result if error is None else error, "raw_response", None)
     failure = classify_ai_failure(error) if error else None
     # These categories are emitted only before transport dispatch. Ambiguous
-    # network/settlement errors remain attempts; they must never be auto-retried.
-    attempted = failure is None or failure.code not in {"local_rate_limit", "request_budget_exceeded", "configuration_error"}
+    # network errors remain attempts; they must never be auto-retried. The
+    # specific quarantine exception proves this invocation never dispatched.
+    attempted = not isinstance(error, SettlementPendingError) and (
+        failure is None or failure.code not in {"local_rate_limit", "request_budget_exceeded", "configuration_error"}
+    )
     return AICallOutcome(result=result, failure=failure,
                          duration_ms=duration, invocation=_summary(record) if record else None,
                          raw_response=raw if isinstance(raw, str) else None, exception=error, attempted=attempted)

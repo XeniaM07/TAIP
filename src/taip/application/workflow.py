@@ -81,6 +81,7 @@ class _PendingDraftEdit:
     edit_id: str
     operations: tuple[EditOperation, ...]
     revision_started: bool
+    target_data: TimetableData
     applied_count: int = 0
     recorded_count: int = 0
 
@@ -110,6 +111,11 @@ class ModelWorkspace:
     _solution_recorded: bool = field(default=False, repr=False, compare=False, metadata={"serialize": False})
     _verification_recorded: bool = field(default=False, repr=False, compare=False, metadata={"serialize": False})
     _pending_edit: _PendingDraftEdit | None = field(default=None, repr=False, compare=False, metadata={"serialize": False})
+    _history_bytes: int = field(default=0, repr=False, compare=False, metadata={"serialize": False})
+    _history_edit_operations: int = field(default=0, repr=False, compare=False, metadata={"serialize": False})
+    _history_snapshot_admissions: int = field(default=0, repr=False, compare=False, metadata={"serialize": False})
+    _history_reserved_bytes: int = field(default=0, repr=False, compare=False, metadata={"serialize": False})
+    _pending_confirmation: str | None = field(default=None, repr=False, compare=False, metadata={"serialize": False})
 
     _TRANSITIONS = {
         WorkflowStatus.PENDING: {WorkflowStatus.EXTRACTING},
@@ -165,9 +171,18 @@ class NoOpBenchmark(BenchmarkPort):
 class InMemorySessionRepository:
     """Thread-safe, expiring storage. Process restart intentionally clears it."""
 
-    def __init__(self, ttl: timedelta = timedelta(hours=2)) -> None:
+    def __init__(
+        self, ttl: timedelta = timedelta(hours=2), *,
+        max_sessions: int = 128, max_retained_bytes: int = 128 * 1024 * 1024,
+    ) -> None:
+        if any(type(value) is not int or value <= 0 for value in (max_sessions, max_retained_bytes)):
+            raise ValueError("Session retention limits must be positive integers.")
         self.ttl = ttl
+        self.max_sessions = max_sessions
+        self.max_retained_bytes = max_retained_bytes
         self._sessions: dict[str, WorkSession] = {}
+        self._retained_bytes: dict[str, int] = {}
+        self._total_retained_bytes = 0
         self._lock = RLock()
 
     def _purge_expired(self, now: datetime) -> None:
@@ -175,11 +190,20 @@ class InMemorySessionRepository:
         for key, session in tuple(self._sessions.items()):
             if session.last_accessed_at < cutoff:
                 del self._sessions[key]
+                self._total_retained_bytes -= self._retained_bytes.pop(key, 0)
 
     def create(self, session: WorkSession) -> None:
         with self._lock:
             self._purge_expired(datetime.now(UTC))
+            if session.session_id in self._sessions:
+                raise ValueError("Session already exists.")
+            if len(self._sessions) >= self.max_sessions:
+                raise ValueError("Session capacity limit reached. Wait for an existing session to expire.")
+            charge = len(session.problem.prompt.encode("utf-8")) + 4096 + 2048 * len(session.models)
+            self._check_retention_capacity(charge)
             self._sessions[session.session_id] = session
+            self._retained_bytes[session.session_id] = charge
+            self._total_retained_bytes += charge
 
     def get(self, session_id: str) -> WorkSession:
         with self._lock:
@@ -191,6 +215,24 @@ class InMemorySessionRepository:
                 raise KeyError("Session not found or expired.") from error
             session.last_accessed_at = now
             return session
+
+    def reserve_history(self, session_id: str, delta_bytes: int) -> None:
+        """Atomically admit retained history; negative deltas refund unused reservations."""
+        if type(delta_bytes) is not int:
+            raise ValueError("History byte reservation must be an integer.")
+        with self._lock:
+            self._purge_expired(datetime.now(UTC))
+            if session_id not in self._sessions:
+                raise KeyError("Session not found or expired.")
+            if self._retained_bytes[session_id] + delta_bytes < 0:
+                raise ValueError("History refund exceeds the retained reservation.")
+            self._check_retention_capacity(delta_bytes)
+            self._retained_bytes[session_id] += delta_bytes
+            self._total_retained_bytes += delta_bytes
+
+    def _check_retention_capacity(self, delta_bytes: int) -> None:
+        if self._total_retained_bytes + delta_bytes > self.max_retained_bytes:
+            raise ValueError("The session history capacity budget is exhausted. Wait for an existing session to expire.")
 
 
 class MockTimetableProvider:
@@ -256,6 +298,10 @@ class MockProviderFactory(AIProviderFactoryPort):
 class WorkflowService:
     """Facade for lifecycle operations; dependencies are supplied via ports."""
 
+    MAX_HISTORY_BYTES = 32 * 1024 * 1024
+    MAX_HISTORY_SNAPSHOTS = 100
+    MAX_HISTORY_EDIT_OPERATIONS = 1000
+
     def __init__(
         self,
         sessions: SessionRepository,
@@ -264,12 +310,16 @@ class WorkflowService:
         benchmark_factory=None,
         *,
         execution: AIExecutionPort | None = None,
+        history_attempt_reservation_bytes: int = 4 * 1024 * 1024,
     ) -> None:
         self.sessions = sessions
         self.providers = providers
         self.verifier = verifier
         self.benchmark_factory = benchmark_factory
         self.execution = execution if execution is not None else InlineAIExecution()
+        if type(history_attempt_reservation_bytes) is not int or history_attempt_reservation_bytes <= 0:
+            raise ValueError("AI history reservation must be a positive byte limit.")
+        self.history_attempt_reservation_bytes = history_attempt_reservation_bytes
         self.mock_demo_prompt = ""
 
     def create_session(self, prompt: str) -> WorkSession:
@@ -306,15 +356,36 @@ class WorkflowService:
         pending = [workspace for workspace in workspaces if workspace.proposal is None]
         for workspace in pending:
             self._ensure_attempt_capacity(workspace)
-        providers = {workspace.model_id: self.providers.get_provider(workspace.model_id) for workspace in pending}
-        for workspace in workspaces:
-            if workspace.proposal is None or not workspace._extraction_recorded or workspace.draft is None:
-                workspace.transition(WorkflowStatus.EXTRACTING)
-        outcomes = self.execution.execute("extract", {
-            model_id: lambda provider=provider: provider.extract(session.problem)
-            for model_id, provider in providers.items()
-        }) if providers else {}
-        # Only provider calls run in the executor. All state and benchmark writes stay serial.
+        admitted = []
+        try:
+            for workspace in pending:
+                self._reserve_ai_history(session, workspace)
+                admitted.append(workspace)
+        except Exception:
+            for workspace in admitted:
+                self._finish_ai_reservation(session, workspace)
+            raise
+        try:
+            providers = {workspace.model_id: self.providers.get_provider(workspace.model_id) for workspace in pending}
+            for workspace in workspaces:
+                if workspace.proposal is None or not workspace._extraction_recorded or workspace.draft is None:
+                    workspace.transition(WorkflowStatus.EXTRACTING)
+            outcomes = self.execution.execute("extract", {
+                model_id: lambda provider=provider: provider.extract(session.problem)
+                for model_id, provider in providers.items()
+            }) if providers else {}
+        except Exception:
+            for workspace in admitted:
+                self._finish_ai_reservation(session, workspace)
+            raise
+        try:
+            return self._commit_extraction_outcomes(session, workspaces, outcomes)
+        finally:
+            for workspace in admitted:
+                self._finish_ai_reservation(session, workspace)
+
+    def _commit_extraction_outcomes(self, session: WorkSession, workspaces: list[ModelWorkspace], outcomes) -> WorkSession:
+        # Only provider calls run in the executor. State and benchmark writes stay serial.
         for workspace in workspaces:
             if workspace.status != WorkflowStatus.EXTRACTING:
                 continue
@@ -327,7 +398,8 @@ class WorkflowService:
                     or proposal.problem_id != session.problem.problem_id
                 ):
                     outcome = self._invalid_outcome(outcome)
-                self._record_attempt(workspace, "extract", outcome)
+                self._record_attempt(session, workspace, "extract", outcome)
+                self._finish_ai_reservation(session, workspace)
                 workspace.extraction_duration_ms = outcome.duration_ms
                 if outcome.failure is not None:
                     self._fail(session, workspace, outcome.failure, "extraction")
@@ -360,14 +432,40 @@ class WorkflowService:
         ):
             raise ValueError("Extract a draft before editing it.")
         assert workspace.problem_management is not None
+        self._validate_unique_ids(data)
+        if workspace._pending_confirmation is not None:
+            raise ValueError("Retry the pending confirmation before editing the draft.")
         if workspace._pending_edit is not None:
-            self._commit_pending_edit(session, workspace)
+            # A retry uses its existing reservation; a different requested target
+            # must be admitted before replay can mutate either local port.
+            if data != workspace._pending_edit.target_data:
+                planned = self._plan_draft_operations(workspace._pending_edit.target_data, data)
+                charge = self._ensure_edit_capacity(workspace, workspace._pending_edit.target_data, data, planned)
+                self._reserve_history_bytes(session, charge)
+                workspace._history_reserved_bytes += charge
+            try:
+                self._commit_pending_edit(session, workspace)
+            except Exception:
+                self._finish_ai_reservation(session, workspace)
+                raise
         operations = self._plan_draft_operations(workspace.draft.data, data)
         if not operations:
+            self._finish_ai_reservation(session, workspace)
             return workspace
+        try:
+            # A new target may already have reserved this charge before pending
+            # recovery. Do not count that reservation twice during admission.
+            charge = self._edit_history_charge(workspace.draft.data, data, operations)
+            if not workspace._history_reserved_bytes:
+                self._ensure_edit_capacity(workspace, workspace.draft.data, data, operations)
+            self._retain_history(session, workspace, charge)
+        finally:
+            self._finish_ai_reservation(session, workspace)
+        workspace._history_edit_operations += len(operations)
         workspace._pending_edit = _PendingDraftEdit(
             edit_id=str(uuid4()), operations=tuple(operations),
             revision_started=workspace.snapshot is None,
+            target_data=data,
         )
         # Invalidate current results before touching either local port. Immutable
         # histories remain available even if a subsequent write needs replay.
@@ -431,8 +529,29 @@ class WorkflowService:
         if workspace.status != WorkflowStatus.DRAFT:
             raise ValueError("Only a changed draft can be confirmed.")
         assert workspace.problem_management is not None
-        workspace.snapshot = workspace.problem_management.confirm(workspace.draft.draft_id, session.problem.prompt)
+        ensure_confirmed = getattr(workspace.problem_management, "ensure_confirmed", None)
+        if workspace._pending_confirmation is None:
+            validation = workspace.problem_management.validate(workspace.draft.draft_id)
+            if not validation.valid:
+                codes = ", ".join(sorted({issue.code for issue in validation.issues}))
+                raise ValueError(f"Cannot confirm an invalid draft. Repair its validation errors first: {codes}")
+            self._ensure_snapshot_capacity(workspace)
+            charge = self._history_size(workspace.draft.data) + len(session.problem.prompt.encode("utf-8")) + 1024
+            self._ensure_history_capacity(workspace, charge)
+            # A known validation failure consumes no admission. An ambiguous
+            # local write keeps one stable reservation until explicit replay.
+            self._retain_history(session, workspace, charge)
+            workspace._history_snapshot_admissions += 1
+            if ensure_confirmed is not None:
+                workspace._pending_confirmation = str(uuid4())
+        if ensure_confirmed is not None:
+            workspace.snapshot = ensure_confirmed(
+                workspace.draft.draft_id, session.problem.prompt, workspace._pending_confirmation,
+            )
+        else:
+            workspace.snapshot = workspace.problem_management.confirm(workspace.draft.draft_id, session.problem.prompt)
         workspace.snapshots.append(workspace.snapshot)
+        workspace._pending_confirmation = None
         workspace.transition(WorkflowStatus.CONFIRMED)
         self._clear_failure(workspace)
         logger.info("session.confirmed session_id=%s model_id=%s version=%s", session_id, model_id, workspace.snapshot.version)
@@ -449,6 +568,7 @@ class WorkflowService:
             raise ValueError("Confirm the draft before solving.")
         if workspace.solution is None:
             self._ensure_attempt_capacity(workspace)
+            self._reserve_ai_history(session, workspace)
         if workspace.status == WorkflowStatus.FAILED:
             workspace.transition(WorkflowStatus.CONFIRMED)
         workspace.transition(WorkflowStatus.SOLVING)
@@ -463,7 +583,7 @@ class WorkflowService:
                     or solution.model_id != model_id or solution.snapshot_id != snapshot.snapshot_id
                 ):
                     outcome = self._invalid_outcome(outcome)
-                self._record_attempt(workspace, "solve", outcome)
+                self._record_attempt(session, workspace, "solve", outcome)
                 workspace.solving_duration_ms = outcome.duration_ms
                 if outcome.failure is not None:
                     self._fail(session, workspace, outcome.failure, "solve")
@@ -473,6 +593,7 @@ class WorkflowService:
                 # Preserve paid output before any local operation can fail.
                 workspace.solution = solution
                 workspace.solutions.append(solution)
+                self._retain_history(session, workspace, self._history_size(solution))
             if not workspace._solution_recorded:
                 record_solution = getattr(session.benchmark, "ensure_solution_recorded", None) or getattr(session.benchmark, "record_solution", None)
                 if record_solution is not None:
@@ -486,6 +607,8 @@ class WorkflowService:
             if workspace.status != WorkflowStatus.FAILED:
                 self._fail(session, workspace, classify_ai_failure(error), "solve")
             raise
+        finally:
+            self._finish_ai_reservation(session, workspace)
         return workspace
 
     def verify(self, session_id: str, model_id: str) -> ModelWorkspace:
@@ -495,12 +618,17 @@ class WorkflowService:
             raise ValueError("Solve the confirmed draft before verification.")
         if workspace.verification is not None and workspace._verification_recorded:
             return workspace
+        if workspace.verification is None:
+            self._ensure_history_capacity(workspace, 1024 * 1024)
+            self._reserve_history_bytes(session, 1024 * 1024)
+            workspace._history_reserved_bytes += 1024 * 1024
         try:
             if workspace.verification is None:
                 started = perf_counter()
                 workspace.verification = self.verifier.verify(workspace.snapshot, workspace.solution)
                 workspace.verification_duration_ms = round((perf_counter() - started) * 1000, 3)
                 workspace.verifications.append(workspace.verification)
+                self._retain_history(session, workspace, self._history_size(workspace.verification))
                 workspace.verification_durations_ms.append(workspace.verification_duration_ms)
             result = workspace.verification
             duration_ms = workspace.verification_duration_ms
@@ -516,6 +644,8 @@ class WorkflowService:
         except Exception as error:
             self._fail(session, workspace, classify_ai_failure(error), "verification")
             raise
+        finally:
+            self._finish_ai_reservation(session, workspace)
         logger.info("session.verified session_id=%s model_id=%s status=%s", session_id, model_id, result.status.value)
         return workspace
 
@@ -555,21 +685,87 @@ class WorkflowService:
             edit_count=workspace.edit_count, error=workspace.error,
         )
 
-    @staticmethod
-    def _record_attempt(workspace: ModelWorkspace, operation: str, outcome: AICallOutcome) -> None:
+    def _record_attempt(self, session: WorkSession, workspace: ModelWorkspace, operation: str, outcome: AICallOutcome) -> None:
         if not getattr(outcome, "attempted", True):
             return
-        workspace.attempts.append(AIAttempt(
+        attempt = AIAttempt(
             attempt_id=str(uuid4()), operation=operation, model_id=workspace.model_id,
             snapshot_id=workspace.snapshot.snapshot_id if operation == "solve" and workspace.snapshot else None,
             duration_ms=outcome.duration_ms, failure=outcome.failure,
             invocation=outcome.invocation, raw_response=outcome.raw_response,
-        ))
+        )
+        workspace.attempts.append(attempt)
+        self._retain_history(session, workspace, self._history_size(attempt))
+        if operation == "extract" and isinstance(outcome.result, ExtractionProposal):
+            self._retain_history(session, workspace, self._history_size(outcome.result))
 
-    @staticmethod
-    def _ensure_attempt_capacity(workspace: ModelWorkspace) -> None:
+    def _ensure_attempt_capacity(self, workspace: ModelWorkspace) -> None:
         if len(workspace.attempts) >= 100:
             raise ValueError("This model has reached the session limit of 100 AI attempts. Create a new session.")
+        self._ensure_history_capacity(workspace, self.history_attempt_reservation_bytes)
+
+    @staticmethod
+    def _history_size(value) -> int:
+        """Conservatively account for retained domain data and private AI evidence."""
+        payload = asdict(value)
+        raw = payload.pop("raw_response", None)
+        # Private raw text is served in bounded chunks. Counting its escaped
+        # whole-response JSON size would charge control characters six times
+        # and could exceed a pre-admitted paid result's reservation.
+        raw_bytes = len(raw.encode("utf-8")) + 64 if raw is not None else 0
+        return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + raw_bytes
+
+    @classmethod
+    def _ensure_history_capacity(cls, workspace: ModelWorkspace, extra_bytes: int) -> None:
+        if workspace._history_bytes + workspace._history_reserved_bytes + extra_bytes > cls.MAX_HISTORY_BYTES:
+            raise ValueError("This model has reached the session history byte limit. Create a new session.")
+
+    def _reserve_history_bytes(self, session: WorkSession, delta_bytes: int) -> None:
+        reserve = getattr(self.sessions, "reserve_history", None)
+        if reserve is not None:
+            reserve(session.session_id, delta_bytes)
+
+    def _retain_history(self, session: WorkSession, workspace: ModelWorkspace, charge: int) -> None:
+        reserved = min(workspace._history_reserved_bytes, charge)
+        extra = charge - reserved
+        self._ensure_history_capacity(workspace, extra)
+        if extra:
+            self._reserve_history_bytes(session, extra)
+        workspace._history_reserved_bytes -= reserved
+        workspace._history_bytes += charge
+
+    def _reserve_ai_history(self, session: WorkSession, workspace: ModelWorkspace) -> None:
+        self._ensure_history_capacity(workspace, self.history_attempt_reservation_bytes)
+        self._reserve_history_bytes(session, self.history_attempt_reservation_bytes)
+        workspace._history_reserved_bytes += self.history_attempt_reservation_bytes
+
+    def _finish_ai_reservation(self, session: WorkSession, workspace: ModelWorkspace) -> None:
+        if workspace._history_reserved_bytes:
+            self._reserve_history_bytes(session, -workspace._history_reserved_bytes)
+            workspace._history_reserved_bytes = 0
+
+    @classmethod
+    def _ensure_snapshot_capacity(cls, workspace: ModelWorkspace) -> None:
+        if workspace._history_snapshot_admissions >= cls.MAX_HISTORY_SNAPSHOTS:
+            raise ValueError("This model has reached the session limit of 100 history snapshots. Create a new session.")
+
+    @classmethod
+    def _ensure_edit_capacity(cls, workspace: ModelWorkspace, current: TimetableData, data: TimetableData, operations: list[EditOperation]) -> int:
+        if not operations:
+            return 0
+        cls._ensure_snapshot_capacity(workspace)
+        if workspace._history_edit_operations + len(operations) > cls.MAX_HISTORY_EDIT_OPERATIONS:
+            raise ValueError("This model has reached the session history edit limit. Create a new session.")
+        # Each command retains a PM memento and benchmark audit JSON. Include
+        # intermediate collections, even though immutable rows normally share memory.
+        charge = cls._edit_history_charge(current, data, operations)
+        cls._ensure_history_capacity(workspace, charge)
+        return charge
+
+    @classmethod
+    def _edit_history_charge(cls, current: TimetableData, data: TimetableData, operations: list[EditOperation]) -> int:
+        data_bytes = cls._history_size(current) + cls._history_size(data)
+        return sum(data_bytes + cls._history_size(operation) + 512 for operation in operations)
 
     @staticmethod
     def _invalid_outcome(outcome: AICallOutcome) -> AICallOutcome:
@@ -631,12 +827,27 @@ class WorkflowService:
     @classmethod
     def _plan_draft_operations(cls, current: TimetableData, data: TimetableData) -> list[EditOperation]:
         """Create stable, replayable commands without mutating either local port."""
+        cls._validate_unique_ids(data)
         operations: list[EditOperation] = []
         for entity_type, (collection, id_field) in cls._EDIT_COLLECTIONS.items():
-            before_by_id = {getattr(item, id_field): item for item in getattr(current, collection)}
+            before_by_id = {}
+            duplicate_ids = set()
+            for item in getattr(current, collection):
+                entity_id = getattr(item, id_field)
+                if entity_id in before_by_id:
+                    duplicate_ids.add(entity_id)
+                else:
+                    before_by_id[entity_id] = item
             after_by_id = {getattr(item, id_field): item for item in getattr(data, collection)}
             for entity_id, old in before_by_id.items():
-                if entity_id not in after_by_id:
+                if entity_id in duplicate_ids:
+                    # PM remove commands explicitly remove every matching ID.
+                    # before_json identifies its first row for optimistic validation;
+                    # the untouched proposal retains every original ambiguous row.
+                    operations.append(EditOperation(str(uuid4()), entity_type, entity_id, "remove", cls._encode_entity(old), None))
+                    if entity_id in after_by_id:
+                        operations.append(EditOperation(str(uuid4()), entity_type, entity_id, "add", None, cls._encode_entity(after_by_id[entity_id])))
+                elif entity_id not in after_by_id:
                     operations.append(EditOperation(str(uuid4()), entity_type, entity_id, "remove", cls._encode_entity(old), None))
                 elif old != after_by_id[entity_id]:
                     operations.append(EditOperation(str(uuid4()), entity_type, entity_id, "update", cls._encode_entity(old), cls._encode_entity(after_by_id[entity_id])))
@@ -644,6 +855,16 @@ class WorkflowService:
                 if entity_id not in before_by_id:
                     operations.append(EditOperation(str(uuid4()), entity_type, entity_id, "add", None, cls._encode_entity(new)))
         return operations
+
+    @classmethod
+    def _validate_unique_ids(cls, data: TimetableData) -> None:
+        for collection, id_field in cls._EDIT_COLLECTIONS.values():
+            seen = set()
+            for item in getattr(data, collection):
+                entity_id = getattr(item, id_field)
+                if entity_id in seen:
+                    raise ValueError(f"Duplicate IDs in {collection} are not allowed in a draft replacement.")
+                seen.add(entity_id)
 
 
 def build_default_service() -> WorkflowService:

@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import fields, is_dataclass
 from enum import Enum
 from collections.abc import Callable
-from typing import Any
+import json
+from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
@@ -17,6 +18,7 @@ from taip.application.session_guard import SessionOperationGuard
 from taip.application.workflow import (
     WorkflowService,
     WorkflowStatus,
+    ModelWorkspace,
     build_default_service,
 )
 from taip.common.timetable_contracts import TimetableData
@@ -59,6 +61,53 @@ def _json(value: Any) -> Any:
     if isinstance(value, (tuple, list)):
         return [_json(item) for item in value]
     return value
+
+
+def _workspace_json(workspace: ModelWorkspace) -> dict[str, Any]:
+    """Project current state without multiplying immutable history into every GET."""
+    history_kinds = ("snapshots", "solutions", "verifications", "attempts")
+    public = {
+        item.name: _json(getattr(workspace, item.name))
+        for item in fields(workspace)
+        if item.metadata.get("serialize", True)
+        and item.name not in (*history_kinds, "proposal", "verification_durations_ms")
+    }
+    public["proposal"] = None if workspace.proposal is None else {
+        item.name: _json(getattr(workspace.proposal, item.name))
+        for item in fields(workspace.proposal) if item.name != "raw_response"
+    }
+    public["attempts"] = _json(workspace.attempts[-5:])
+    public["history_counts"] = {kind: len(getattr(workspace, kind)) for kind in history_kinds}
+    return public
+
+
+def _history_page(workspace: ModelWorkspace, kind: str, offset: int, limit: int) -> dict[str, Any]:
+    entries = getattr(workspace, kind)
+    items = []
+    size = 0
+    # Include complete immutable entries only; next_offset advances by entries
+    # actually returned so byte-bound pages never skip evidence.
+    for entry in entries[offset:offset + limit]:
+        encoded = _json(entry)
+        entry_size = len(json.dumps(encoded, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if items and size + entry_size > 1024 * 1024 - 1024:
+            break
+        if entry_size > 1024 * 1024 - 1024:
+            raise HTTPException(413, "A history entry exceeds the supported page size.")
+        items.append(encoded)
+        size += entry_size
+    next_offset = offset + len(items)
+    return {"kind": kind, "offset": offset, "total": len(entries), "items": items,
+            "next_offset": next_offset if next_offset < len(entries) else None}
+
+
+def _raw_page(raw: str | None, offset: int, limit: int) -> dict[str, Any]:
+    if raw is None:
+        raise HTTPException(404, "Raw response not found.")
+    text = raw[offset:offset + limit]
+    next_offset = offset + len(text)
+    return {"offset": offset, "total": len(raw), "text": text,
+            "next_offset": next_offset if next_offset < len(raw) else None}
 
 
 def _data_from_json(raw: dict[str, Any]) -> TimetableData:
@@ -125,7 +174,7 @@ def create_app(
                 # validation and prevents arbitrary exception text escaping.
                 raise HTTPException(500, "Internal server error.") from None
             raise
-        return _session_json(get_session(session_id)) if session_view else _json(workspace)
+        return _session_json(get_session(session_id)) if session_view else _workspace_json(workspace)
 
     @app.get("/api/health")
     def health():
@@ -163,6 +212,36 @@ def create_app(
         if workspace.draft is None:
             raise HTTPException(404, "Draft not found.")
         return _json(workspace.draft)
+
+    @app.get("/api/sessions/{session_id}/models/{model_id}/history")
+    def model_history(
+        session_id: str, model_id: str,
+        kind: Literal["snapshots", "solutions", "verifications", "attempts"],
+        offset: int = Query(default=0, ge=0), limit: int = Query(default=5, ge=1, le=10),
+    ):
+        workspace = run(workflow._workspace, get_session(session_id), model_id)
+        return _history_page(workspace, kind, offset, limit)
+
+    @app.get("/api/sessions/{session_id}/models/{model_id}/proposal/raw")
+    def proposal_raw(
+        session_id: str, model_id: str,
+        offset: int = Query(default=0, ge=0), limit: int = Query(default=16384, ge=1, le=16384),
+    ):
+        workspace = run(workflow._workspace, get_session(session_id), model_id)
+        if workspace.proposal is None:
+            raise HTTPException(404, "Proposal not found.")
+        return _raw_page(workspace.proposal.raw_response, offset, limit)
+
+    @app.get("/api/sessions/{session_id}/models/{model_id}/attempts/{attempt_id}/raw")
+    def attempt_raw(
+        session_id: str, model_id: str, attempt_id: str,
+        offset: int = Query(default=0, ge=0), limit: int = Query(default=16384, ge=1, le=16384),
+    ):
+        workspace = run(workflow._workspace, get_session(session_id), model_id)
+        attempt = next((entry for entry in workspace.attempts if entry.attempt_id == attempt_id), None)
+        if attempt is None:
+            raise HTTPException(404, "Attempt not found.")
+        return _raw_page(attempt.raw_response, offset, limit)
 
     @app.patch("/api/sessions/{session_id}/drafts/{model_id}")
     def edit_draft(session_id: str, model_id: str, request: EditDraftRequest, session_view: bool = False):
@@ -232,7 +311,7 @@ def _session_json(session) -> dict[str, Any]:
         }},
         "created_at": session.created_at.isoformat(),
         "last_accessed_at": session.last_accessed_at.isoformat(),
-        "models": {model_id: _json(workspace) for model_id, workspace in session.models.items()},
+        "models": {model_id: _workspace_json(workspace) for model_id, workspace in session.models.items()},
     }
 
 
