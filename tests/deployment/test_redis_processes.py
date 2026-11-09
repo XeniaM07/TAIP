@@ -10,7 +10,10 @@ from contextlib import contextmanager
 import logging
 import multiprocessing
 import os
+from pathlib import Path
 from queue import Empty
+import secrets
+from tempfile import TemporaryDirectory
 import time
 import unittest
 from uuid import uuid4
@@ -30,6 +33,14 @@ def _client(url):
 
     return redis.Redis.from_url(url, socket_connect_timeout=3, socket_timeout=3,
                                 retry=Retry(NoBackoff(), 0), retry_on_error=[])
+
+
+def _safe_redis_call(label, callback, *args, **kwargs):
+    """Keep integration diagnostics independent of connection or ACL secrets."""
+    try:
+        return callback(*args, **kwargs)
+    except Exception as error:
+        raise AssertionError(f"{label} failed ({type(error).__name__}).") from None
 
 
 def _quota_worker(url, namespace, worker, attempts, policy_values, shared_id,
@@ -135,18 +146,19 @@ class RealRedisProcessTests(unittest.TestCase):
         self.addCleanup(self._delete_namespace)
         self.limiter = RedisRateLimiter(self.client, namespace=self.namespace)
 
-    def _delete_namespace(self):
+    def _delete_namespace(self, client=None):
+        client = self.client if client is None else client
         prefix = (self.namespace + ":").encode("ascii")
         batch = []
-        for key in self.client.scan_iter(match=prefix + b"*", count=128):
+        for key in client.scan_iter(match=prefix + b"*", count=128):
             if not key.startswith(prefix):
                 raise AssertionError("Integration cleanup escaped its namespace.")
             batch.append(key)
             if len(batch) == 128:
-                self.client.delete(*batch)
+                client.delete(*batch)
                 batch.clear()
         if batch:
-            self.client.delete(*batch)
+            client.delete(*batch)
 
     @staticmethod
     def _stop_process(process):
@@ -292,6 +304,86 @@ class RealRedisProcessTests(unittest.TestCase):
         replacement.start()
         self.assertTrue(replacement.is_current())
         self.assertFalse(competitor.is_current())
+
+    def test_generated_restricted_acl_supports_quota_completion_and_core_ownership(self):
+        import redis
+        from taip.deployment.ownership import CoreOwnershipLease
+        from taip.deployment.setup_public import prepare_deployment
+
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        directory = Path(temporary.name) / "restricted-redis-deployment"
+        prepare_deployment(directory)
+        users = [line.split() for line in (directory / "redis.acl").read_text().splitlines()
+                 if line.startswith("user taip ")]
+        self.assertEqual(len(users), 1, "Generated deployment must declare its Redis user.")
+        # Consume the generated command policy itself. A copied allowlist would
+        # conceal a missing command in the actual deployment's ACL.
+        command_rules = [rule for rule in users[0][2:] if rule.startswith(("+", "-"))]
+        self.assertTrue(command_rules, "Generated Redis ACL must declare command permissions.")
+        username = "taip_test_" + uuid4().hex
+        password = secrets.token_urlsafe(48)
+        self.addCleanup(_safe_redis_call, "Restricted Redis user cleanup",
+                        self.client.execute_command, "ACL", "DELUSER", username)
+        _safe_redis_call(
+            "Restricted Redis user creation", self.client.execute_command,
+            "ACL", "SETUSER", username, "reset", "on", ">" + password,
+            "~" + self.namespace + ":*", *command_rules,
+        )
+
+        # This contract uses production DB0: create_redis_client selects DB0,
+        # so production's restricted ACL deliberately needs no SELECT command.
+        # Preserve the selected URL's host/socket and TLS settings without ever
+        # reconstructing or printing its URL. Use an admin clone for DB0 cleanup.
+        source_pool = self.client.connection_pool
+        admin_options = {**source_pool.connection_kwargs, "db": 0}
+        admin_pool = _safe_redis_call(
+            "Redis DB0 admin connection setup", redis.ConnectionPool,
+            connection_class=source_pool.connection_class, **admin_options,
+        )
+        self.addCleanup(_safe_redis_call, "Redis DB0 admin pool shutdown", admin_pool.disconnect)
+        admin = redis.Redis(connection_pool=admin_pool)
+        self.addCleanup(_safe_redis_call, "Redis DB0 admin client shutdown", admin.close)
+        self.addCleanup(_safe_redis_call, "Redis DB0 namespace cleanup", self._delete_namespace, admin)
+        options = {name: value for name, value in admin_options.items()
+                   if name not in {"username", "password", "credential_provider"}}
+        pool = _safe_redis_call(
+            "Restricted Redis connection setup", redis.ConnectionPool,
+            connection_class=source_pool.connection_class, username=username,
+            password=password, **options,
+        )
+        self.addCleanup(_safe_redis_call, "Restricted Redis pool shutdown", pool.disconnect)
+        restricted = redis.Redis(connection_pool=pool)
+        self.addCleanup(_safe_redis_call, "Restricted Redis client shutdown", restricted.close)
+        self.assertTrue(_safe_redis_call("Restricted Redis authentication", restricted.ping))
+
+        limiter = RedisRateLimiter(restricted, namespace=self.namespace)
+        policy = RateLimitPolicy(max_concurrent=1)
+        first = limiter.acquire(_KEY, policy=policy, estimated_tokens=20,
+                                provider="integration", model_id="logical-test")
+        self.assertEqual(limiter.snapshot(_KEY).in_flight, 1)
+        first.finish(actual_tokens=7)
+        first.finish(actual_tokens=999)
+        settled = limiter.snapshot(_KEY)
+        self.assertEqual((settled.requests_in_day, settled.tokens_in_minute, settled.in_flight),
+                         (1, 7, 0))
+        second = limiter.acquire(_KEY, policy=policy, estimated_tokens=10,
+                                 provider="integration", model_id="logical-test")
+        second.finish(actual_tokens=0)
+        settled = limiter.snapshot(_KEY)
+        self.assertEqual((settled.requests_in_day, settled.tokens_in_minute, settled.in_flight),
+                         (2, 7, 0))
+
+        owner = CoreOwnershipLease(restricted, namespace=self.namespace, lease_seconds=0.6)
+        self.addCleanup(owner.close)
+        owner.start()
+        time.sleep(0.9)  # Longer than the initial TTL, so renewal must succeed.
+        self.assertTrue(owner.is_current(), "Restricted Redis ownership renewal failed.")
+        owner.close()
+        remaining = _safe_redis_call("Restricted Redis ownership release check",
+                                     admin.exists, self.namespace + ":core-owner")
+        self.assertEqual(remaining, 0, "Restricted Redis ownership release failed.")
+        self.assertTrue(_safe_redis_call("Restricted Redis client reuse", restricted.ping))
 
 
 if __name__ == "__main__":

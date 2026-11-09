@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -88,6 +89,22 @@ class PublicSetupTests(unittest.TestCase):
     def test_default_origin_keeps_the_nonstandard_https_port(self):
         config = self.module.prepare_deployment(self.directory)
         self.assertIn("TAIP_PUBLIC_ORIGIN=https://localhost:8443\n", config.read_text())
+
+    def test_generated_acl_covers_actual_quota_and_ownership_lua_commands(self):
+        self.module.prepare_deployment(self.directory)
+        acl = (self.directory / "redis.acl").read_text()
+        allowed = {word[1:].upper() for word in acl.split() if word.startswith("+")}
+        deployment = Path(self.module.__file__).parent
+        required = set()
+        for name in ("quota.lua", "ownership.py"):
+            source = (deployment / name).read_text(encoding="utf-8")
+            arguments = re.findall(r"\bredis\.(?:call|pcall)\s*\(\s*([^,\n)]+)", source)
+            self.assertTrue(arguments, f"{name} must expose the Lua command sites to this contract")
+            for argument in arguments:
+                literal = re.fullmatch(r"['\"]([A-Za-z0-9_]+)['\"]", argument.strip())
+                self.assertIsNotNone(literal, "Dynamic Lua command names require an explicit ACL contract")
+                required.add(literal.group(1).upper())
+        self.assertEqual(required - allowed, set(), "Generated ACL must permit every actual Lua command")
 
     @unittest.skipUnless(shutil.which("docker"), "Docker CLI is needed to parse Compose")
     def test_compose_tmpfs_options_remain_with_each_absolute_mount(self):

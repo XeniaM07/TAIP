@@ -61,7 +61,7 @@ def run_smoke(directory: Path, origin: str, *, http_port: int, redis_unavailable
         while True:
             try:
                 response = client.get("/")
-                if response.status_code not in (502, 503):
+                if response.status_code != 502:
                     break
             except httpx.RequestError:
                 if time.monotonic() >= deadline:

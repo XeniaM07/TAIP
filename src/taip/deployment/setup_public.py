@@ -116,7 +116,7 @@ def prepare_deployment(
     redis_commands = (
         "+ping +hello +client|setinfo +client|setname "
         "+get +set +del +time +exists +pexpire "
-        "+zadd +zrem +zrange +zcard +zcount +zremrangebyscore +zrangebyscore "
+        "+zadd +zrem +zrange +zcard +zcount +zscore +zremrangebyscore +zrangebyscore "
         "+hset +hget +hdel +sadd +srem +eval"
     )
     _private_write(
