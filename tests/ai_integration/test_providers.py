@@ -133,7 +133,7 @@ class TimetableProviderTests(unittest.TestCase):
                     self.assertEqual(body["provider"], {"allow_fallbacks": False, "require_parameters": True})
 
     def test_schema_mode_is_explicit_and_never_silently_downgraded(self):
-        from taip.ai_integration.response_schema import extraction_json_schema
+        from taip.ai_integration.response_schema import extraction_json_schema, groq_response_schema
         for kind in ProviderKind:
             with self.subTest(provider=kind):
                 transport = RecordingTransport(completion(kind))
@@ -145,7 +145,10 @@ class TimetableProviderTests(unittest.TestCase):
                     shape = body["response_format"]
                     self.assertEqual(shape["type"], "json_schema")
                     self.assertIs(shape["json_schema"]["strict"], True)
-                    self.assertEqual(shape["json_schema"]["schema"], extraction_json_schema())
+                    expected = extraction_json_schema()
+                    if kind is ProviderKind.GROQ:
+                        expected = groq_response_schema(expected)
+                    self.assertEqual(shape["json_schema"]["schema"], expected)
 
     def test_solve_sends_confirmed_data_and_keeps_invalid_assignments(self):
         raw = '{"assignments":[{"requirement_id":"unknown","occurrence":-1,"slot_id":"unknown","room_id":"unknown"}]}'

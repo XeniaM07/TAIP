@@ -21,7 +21,9 @@ from taip.ai_integration.prompts import (
     PromptMessages, build_extraction_prompt, build_solution_prompt,
 )
 from taip.ai_integration.response_codec import parse_extraction_response, parse_solution_response
-from taip.ai_integration.response_schema import extraction_json_schema, solution_json_schema
+from taip.ai_integration.response_schema import (
+    extraction_json_schema, groq_response_schema, solution_json_schema,
+)
 from taip.common.timetable_contracts import (
     ExtractionProposal, OriginalProblem, TimetableProblemSnapshot, TimetableSolution,
 )
@@ -209,8 +211,9 @@ class _ChatTimetableAdapter(TimetableAIAdapter):
     def _request(self, messages: PromptMessages, schema: dict[str, object]) -> ProviderCompletion:
         output_format: dict[str, object] = {"type": "json_object"}
         if self._config.use_json_schema:
+            provider_schema = groq_response_schema(schema) if self._provider_kind is ProviderKind.GROQ else schema
             output_format = {"type": "json_schema", "json_schema": {
-                "name": "timetable_response", "strict": True, "schema": schema,
+                "name": "timetable_response", "strict": True, "schema": provider_schema,
             }}
         body: dict[str, object] = {
             "model": self._config.api_model_id,
