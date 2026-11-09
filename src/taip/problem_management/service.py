@@ -51,6 +51,9 @@ class TimetableProblemService:
     def __init__(self, repository: InMemoryProblemRepository) -> None:
         self.repository = repository
         self.audit_log = InMemoryAuditLog()
+        self._confirmation_requests: dict[str, tuple[TimetableProblemSnapshot, int]] = {}
+        self._confirmed_tokens: dict[str, TimetableProblemSnapshot] = {}
+        self._active_confirmation: tuple[TimetableProblemSnapshot, int] | None = None
 
     def create_draft(self, proposal: ExtractionProposal) -> ProblemDraft:
         """Create an editable draft from an AI extraction proposal."""
@@ -125,13 +128,21 @@ class TimetableProblemService:
                 f"Cannot confirm invalid draft: {validation.issues}"
             )
 
+        snapshot = self._new_snapshot(draft, original_prompt) if self._active_confirmation is None else self._active_confirmation[0]
+        if self._active_confirmation is not None:
+            self._check_confirmation_request(draft, original_prompt, self._active_confirmation)
+
+        self.repository.save_snapshot(snapshot)
+        return snapshot
+
+    def _new_snapshot(self, draft: ProblemDraft, original_prompt: str) -> TimetableProblemSnapshot:
         versions = [
             snapshot.version
             for snapshot in self.repository.snapshots.values()
-            if snapshot.draft_id == draft_id
+            if snapshot.draft_id == draft.draft_id
         ]
 
-        snapshot = TimetableProblemSnapshot(
+        return TimetableProblemSnapshot(
             snapshot_id=str(uuid4()),
             draft_id=draft.draft_id,
             problem_id=draft.problem_id,
@@ -141,8 +152,65 @@ class TimetableProblemService:
             data=draft.data,
         )
 
-        self.repository.save_snapshot(snapshot)
-        return snapshot
+    @staticmethod
+    def _check_confirmation_request(
+        draft: ProblemDraft, original_prompt: str,
+        request: tuple[TimetableProblemSnapshot, int],
+    ) -> None:
+        expected, revision = request
+        if (draft.revision != revision or draft.draft_id != expected.draft_id
+                or draft.problem_id != expected.problem_id or draft.model_id != expected.model_id
+                or draft.data != expected.data or original_prompt != expected.original_prompt):
+            raise ValueError("The confirmation token belongs to a different draft revision or prompt.")
+
+    def ensure_confirmed(
+        self, draft_id: str, original_prompt: str, confirmation_id: str,
+    ) -> TimetableProblemSnapshot:
+        """Replay one local confirmation with an ID allocated before any write."""
+        draft = self.get_draft(draft_id)
+        request = self._confirmation_requests.get(confirmation_id)
+        if request is None:
+            if not original_prompt.strip() or not self.validate(draft_id).valid:
+                raise ValueError("Cannot confirm an invalid draft or empty original prompt.")
+            if len(self._confirmation_requests) >= 100:
+                raise ValueError("This draft service has reached its confirmation history limit.")
+            request = (self._new_snapshot(draft, original_prompt), draft.revision)
+            self._confirmation_requests[confirmation_id] = request
+        self._check_confirmation_request(draft, original_prompt, request)
+        expected = request[0]
+        if confirmation_id in self._confirmed_tokens:
+            return self._confirmed_tokens[confirmation_id]
+        try:
+            stored = self.get_snapshot(expected.snapshot_id)
+        except KeyError:
+            pass
+        else:
+            if stored != expected:
+                raise ValueError("The reserved snapshot identity contains different confirmation data.")
+            self._confirmed_tokens[confirmation_id] = stored
+            return stored
+
+        previous = self._active_confirmation
+        self._active_confirmation = request
+        try:
+            snapshot = self.confirm(draft_id, original_prompt)
+            if snapshot != expected:
+                raise ValueError("Confirmation did not return its reserved snapshot.")
+            self._confirmed_tokens[confirmation_id] = snapshot
+            return snapshot
+        except Exception:
+            # The repository or an enclosing port wrapper can commit and then
+            # lose its acknowledgement. Cache only an exact known-ID match.
+            try:
+                stored = self.get_snapshot(expected.snapshot_id)
+            except KeyError:
+                pass
+            else:
+                if stored == expected:
+                    self._confirmed_tokens[confirmation_id] = stored
+            raise
+        finally:
+            self._active_confirmation = previous
 
     def get_snapshot(
         self,

@@ -41,9 +41,11 @@ class WorkflowApiTests(unittest.IsolatedAsyncioTestCase):
         draft_a = (await self.client.get(f"/api/sessions/{session_id}/drafts/{MOCK_MODEL_IDS[0]}")).json()
         draft_b = (await self.client.get(f"/api/sessions/{session_id}/drafts/{MOCK_MODEL_IDS[1]}")).json()
         self.assertNotEqual(draft_a["draft_id"], draft_b["draft_id"])
-        extracted_session = (await self.client.get(f"/api/sessions/{session_id}")).json()
+        extracted_raw = (await self.client.get(
+            f"/api/sessions/{session_id}/models/{MOCK_MODEL_IDS[0]}/proposal/raw"
+        )).json()
         self.assertEqual(
-            extracted_session["models"][MOCK_MODEL_IDS[0]]["proposal"]["raw_response"],
+            extracted_raw["text"],
             "Deterministic response for the exact documented mock fixture.",
         )
 
@@ -115,7 +117,10 @@ class WorkflowApiTests(unittest.IsolatedAsyncioTestCase):
             f"/api/sessions/{session_id}/models/{MOCK_MODEL_IDS[0]}/confirm"
         )
         state = (await self.client.get(f"/api/sessions/{session_id}")).json()
-        snapshots = state["models"][MOCK_MODEL_IDS[0]]["snapshots"]
+        self.assertEqual(state["models"][MOCK_MODEL_IDS[0]]["history_counts"]["snapshots"], 2)
+        snapshots = (await self.client.get(
+            f"/api/sessions/{session_id}/models/{MOCK_MODEL_IDS[0]}/history", params={"kind": "snapshots"},
+        )).json()["items"]
         self.assertEqual(second.json()["snapshot"]["version"], 2)
         self.assertEqual([item["snapshot_id"] for item in snapshots], [first_id, second.json()["snapshot"]["snapshot_id"]])
 

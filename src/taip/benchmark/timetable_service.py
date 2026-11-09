@@ -72,6 +72,7 @@ class TimetableBenchmarkService:
             else BenchmarkResultPublisher()
         )
         self.reference_cases = reference_cases
+        self._started_revisions: set[tuple[str, str, str]] = set()
 
     def record_extraction(
         self,
@@ -117,6 +118,62 @@ class TimetableBenchmarkService:
                 f"model '{model_id}'."
             )
         self.repository.save_run(replace(record, edits=record.edits + (operation,)))
+
+    def start_revision(
+        self, comparison_id: str, model_id: str, *, revision_id: str | None = None,
+    ) -> None:
+        """Replace current results explicitly, retaining the complete previous run."""
+        key = (comparison_id, model_id, revision_id) if revision_id is not None else None
+        if key is not None and key in self._started_revisions:
+            return
+        record = self._get_run(comparison_id, model_id)
+        self.repository.archive_run(record)
+        self.repository.save_run(replace(
+            record, solution=None, solving_duration_ms=None,
+            verification=None, verification_duration_ms=None,
+        ))
+        if key is not None:
+            self._started_revisions.add(key)
+
+    def ensure_revision_started(self, comparison_id: str, model_id: str, revision_id: str) -> None:
+        self.start_revision(comparison_id, model_id, revision_id=revision_id)
+
+    def ensure_edit_recorded(self, comparison_id: str, model_id: str, operation: EditOperation) -> None:
+        record = self._get_run(comparison_id, model_id)
+        existing = next((edit for edit in record.edits if edit.operation_id == operation.operation_id), None)
+        if existing == operation:
+            return
+        if existing is not None:
+            raise ValueError("A different edit is already recorded with this operation ID.")
+        self.record_edit(comparison_id, model_id, operation)
+
+    def ensure_extraction_recorded(
+        self, comparison_id: str, proposal: ExtractionProposal,
+        duration_ms: float | None = None,
+    ) -> None:
+        """Allow local commit replay without weakening strict record operations."""
+        if self._has_run(self.session_id, comparison_id, proposal.model_id):
+            if self._get_run(comparison_id, proposal.model_id).proposal == proposal:
+                return
+            raise ValueError("A different extraction is already recorded for this model.")
+        self.record_extraction(comparison_id, proposal, duration_ms)
+
+    def ensure_solution_recorded(
+        self, comparison_id: str, solution: TimetableSolution, duration_ms: float,
+    ) -> None:
+        record = self._get_run(comparison_id, solution.model_id)
+        if record.solution == solution:
+            return
+        self.record_solution(comparison_id, solution, duration_ms)
+
+    def ensure_verification_recorded(
+        self, comparison_id: str, model_id: str,
+        result: TimetableVerificationResult, duration_ms: float | None = None,
+    ) -> None:
+        record = self._get_run(comparison_id, model_id)
+        if record.verification == result:
+            return
+        self.record_verification(comparison_id, model_id, result, duration_ms=duration_ms)
 
     def record_solution(
         self,

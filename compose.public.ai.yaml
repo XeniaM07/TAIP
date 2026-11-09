@@ -1,0 +1,28 @@
+# Live opt-in: docker compose --env-file <private-dir>/public.env -f compose.public.yaml -f compose.public.ai.yaml up --build -d
+# Supply the three exact *_MODEL IDs and *_API_KEY_FILE paths through a private
+# operator environment. Key files must be regular files outside Git worktrees.
+services:
+  core:
+    environment:
+      TAIP_LIVE_AI: "true"
+      GEMINI_MODEL: ${GEMINI_MODEL:?Set the exact Gemini model ID}
+      GROQ_MODEL: ${GROQ_MODEL:?Set the exact Groq model ID}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:?Set the exact OpenRouter model ID}
+      GEMINI_JSON_SCHEMA: "${GEMINI_JSON_SCHEMA:-false}"
+      GROQ_JSON_SCHEMA: "${GROQ_JSON_SCHEMA:-false}"
+      OPENROUTER_JSON_SCHEMA: "${OPENROUTER_JSON_SCHEMA:-false}"
+      GEMINI_API_KEY_FILE: /run/secrets/gemini_api_key
+      GROQ_API_KEY_FILE: /run/secrets/groq_api_key
+      OPENROUTER_API_KEY_FILE: /run/secrets/openrouter_api_key
+    secrets:
+      - gemini_api_key
+      - groq_api_key
+      - openrouter_api_key
+
+secrets:
+  gemini_api_key:
+    file: ${GEMINI_API_KEY_FILE:?Set an external private Gemini key file path}
+  groq_api_key:
+    file: ${GROQ_API_KEY_FILE:?Set an external private Groq key file path}
+  openrouter_api_key:
+    file: ${OPENROUTER_API_KEY_FILE:?Set an external private OpenRouter key file path}

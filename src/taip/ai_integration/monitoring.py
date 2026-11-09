@@ -6,6 +6,7 @@ Only safe identifiers, timing, outcomes, and error categories enter logging.
 
 from collections.abc import Callable
 from contextvars import ContextVar
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from functools import wraps
 import logging
@@ -42,6 +43,19 @@ class InvocationRecord:
 
 
 InvocationObserver = Callable[[InvocationRecord], None]
+_scoped_observers: ContextVar[tuple[InvocationObserver, ...]] = ContextVar("ai_scoped_observers", default=())
+
+
+@contextmanager
+def observe_invocations(observer: InvocationObserver):
+    """Observe only calls in this context, without retaining global history."""
+    if not callable(observer):
+        raise AIConfigurationError("observer")
+    token = _scoped_observers.set(_scoped_observers.get() + (observer,))
+    try:
+        yield
+    finally:
+        _scoped_observers.reset(token)
 
 
 class _InvocationSource(Protocol):
@@ -132,6 +146,8 @@ def _publish(record: InvocationRecord, observer: InvocationObserver | None) -> N
     # A nested call has already restored its parent's context. Suspend capture
     # during delivery so callbacks and log handlers cannot mutate that parent.
     token = _active_capture.set(None)
+    scoped = _scoped_observers.get()
+    scoped_token = _scoped_observers.set(())
     try:
         _log_safely(
             logging.WARNING if record.settlement_pending else logging.INFO,
@@ -160,7 +176,13 @@ def _publish(record: InvocationRecord, observer: InvocationObserver | None) -> N
                 observer(record)
             except Exception:
                 _log_safely(logging.WARNING, "AI invocation observer failed.")
+        for callback in scoped:
+            try:
+                callback(record)
+            except Exception:
+                _log_safely(logging.WARNING, "AI invocation observer failed.")
     finally:
+        _scoped_observers.reset(scoped_token)
         _active_capture.reset(token)
 
 

@@ -1,6 +1,7 @@
 """Lab06 AI providers through the existing session-owning orchestration seam."""
 
 import unittest
+from threading import Lock
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,6 +13,8 @@ from taip.ai_integration.factory import AIProviderFactory
 from taip.ai_integration.http_transport import HTTPJSONTransport
 from taip.ai_integration.mock_provider import MockAIProvider
 from taip.application.workflow import InMemorySessionRepository, WorkflowService, WorkflowStatus
+from taip.benchmark.timetable_service import TimetableBenchmarkService
+from taip.orchestration.timetable_execution import TimetableExecutionCoordinator
 from taip.common.timetable_contracts import VerificationStatus
 from taip.mathematical_verification.timetable_verifier import TimetableVerifier
 from tests.ai_integration.test_mock_provider import (
@@ -135,6 +138,69 @@ class WorkflowAIIntegrationTests(unittest.TestCase):
         self.assertTrue(all(record.provider == "mock" and record.duration_ms >= 0 for record in records))
         self.assertEqual(records[0].raw_response, EXTRACTION_RESPONSE)
         self.assertEqual(records[1].raw_response, SOLUTION_RESPONSE)
+
+    def test_one_three_provider_session_has_six_generations_and_replays_have_none(self):
+        requests = []
+        lock = Lock()
+        counts = {}
+
+        def handler(request):
+            kind = {
+                "generativelanguage.googleapis.com": ProviderKind.GEMINI,
+                "api.groq.com": ProviderKind.GROQ,
+                "openrouter.ai": ProviderKind.OPENROUTER,
+            }[request.url.host]
+            with lock:
+                requests.append(request)
+                counts[kind] = counts.get(kind, 0) + 1
+                number = counts[kind]
+            return httpx.Response(200, json=completion(kind, EXTRACTION_RESPONSE if number == 1 else SOLUTION_RESPONSE))
+
+        transport = HTTPJSONTransport(transport=httpx.MockTransport(handler))
+        self.addCleanup(transport.close)
+        coordinator = TimetableExecutionCoordinator()
+        self.addCleanup(coordinator.close)
+        factory = AIProviderFactory(tuple(self.config(kind) for kind in ProviderKind), transport=transport)
+        service = WorkflowService(InMemorySessionRepository(), factory, TimetableVerifier(), TimetableBenchmarkService, execution=coordinator)
+        session = service.create_session(PROMPT)
+        service.extract(session.session_id)
+        for model_id in session.models:
+            service.confirm(session.session_id, model_id)
+            service.solve(session.session_id, model_id)
+            service.verify(session.session_id, model_id)
+        self.assertEqual(len(requests), 6)
+        service.extract(session.session_id)
+        for model_id, workspace in session.models.items():
+            service.edit_draft(session.session_id, model_id, workspace.draft.data)
+            service.confirm(session.session_id, model_id)
+            service.solve(session.session_id, model_id)
+            service.verify(session.session_id, model_id)
+            self.assertEqual(len(workspace.attempts), 2)
+            self.assertEqual([item.operation for item in workspace.attempts], ["extract", "solve"])
+            self.assertEqual(workspace.attempts[0].raw_response, EXTRACTION_RESPONSE)
+            self.assertEqual(workspace.attempts[1].raw_response, SOLUTION_RESPONSE)
+            self.assertIsNotNone(workspace.attempts[1].invocation)
+        self.assertEqual(len(requests), 6)
+        self.assertEqual(len(service.compare(session.session_id).model_runs), 3)
+
+    def test_failed_raw_response_remains_in_first_private_attempt_after_retry(self):
+        kind = ProviderKind.GROQ
+        transport = RecordingTransport(
+            completion(kind, "private malformed response"), completion(kind, EXTRACTION_RESPONSE),
+        )
+        factory = AIProviderFactory((self.config(kind),), transport=transport)
+        service = WorkflowService(InMemorySessionRepository(), factory, TimetableVerifier())
+        session = service.create_session(PROMPT)
+        service.extract(session.session_id)
+        workspace = session.models[kind.value]
+        first_attempt = workspace.attempts[0]
+        self.assertEqual(first_attempt.raw_response, "private malformed response")
+        self.assertEqual(first_attempt.failure.code, "invalid_json")
+        service.extract(session.session_id)
+        self.assertIs(workspace.attempts[0], first_attempt)
+        self.assertEqual(len(workspace.attempts), 2)
+        self.assertEqual(workspace.status, WorkflowStatus.DRAFT)
+        self.assertNotIn("private malformed response", repr(workspace.attempts))
 
 
 if __name__ == "__main__":
