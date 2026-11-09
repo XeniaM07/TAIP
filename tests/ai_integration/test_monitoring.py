@@ -230,6 +230,8 @@ class MonitoringTests(unittest.TestCase):
             "ai_error_code": None,
             "ai_http_status_code": None,
             "ai_retry_after_seconds": None,
+            "ai_generation_parameters": None,
+            "ai_usage": None,
         }
         self.assertEqual({k: v for k, v in vars(log).items() if k.startswith("ai_")}, expected)
         for private_value in (private_prompt, private_raw, "secret-parsed-result"):

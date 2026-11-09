@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterable, Sequence
+from dataclasses import asdict
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -128,6 +129,13 @@ def _model_summary(
     }
 
 
+def _invocation_summary(record: InvocationRecord) -> dict[str, object]:
+    summary = {field: getattr(record, field) for field in _PUBLIC_INVOCATION_FIELDS}
+    summary["generation_parameters"] = asdict(record.generation_parameters) if record.generation_parameters else None
+    summary["usage"] = asdict(record.usage) if record.usage else None
+    return summary
+
+
 def _run_demo(
     factory: AIProviderFactoryPort,
     records: list[InvocationRecord],
@@ -160,10 +168,7 @@ def _run_demo(
     return {
         "mode": mode,
         "models": summaries,
-        "invocations": [
-            {field: getattr(record, field) for field in _PUBLIC_INVOCATION_FIELDS}
-            for record in records
-        ],
+        "invocations": [_invocation_summary(record) for record in records],
     }
 
 

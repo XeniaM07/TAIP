@@ -6,7 +6,7 @@ Only safe identifiers, timing, outcomes, and error categories enter logging.
 
 from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import wraps
 import logging
 from time import perf_counter_ns
@@ -14,6 +14,7 @@ from typing import Concatenate, Literal, ParamSpec, Protocol, TypeVar
 from uuid import uuid4
 
 from .errors import AIConfigurationError, AIProviderError, AIResponseError
+from .telemetry import GenerationParameters, ProviderUsage
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +35,8 @@ class InvocationRecord:
     retry_after_seconds: float | None
     result: object | None = field(default=None, repr=False)
     raw_response: str | None = field(default=None, repr=False)
+    generation_parameters: GenerationParameters | None = None
+    usage: ProviderUsage | None = None
 
 
 InvocationObserver = Callable[[InvocationRecord], None]
@@ -58,6 +61,8 @@ class _ResponseCapture:
     raw_response: str | None = field(default=None, repr=False)
     returned_model_id: str | None = None
     upstream_provider: str | None = None
+    generation_parameters: GenerationParameters | None = None
+    usage: ProviderUsage | None = None
 
 
 _active_capture: ContextVar[_ResponseCapture | None] = ContextVar(
@@ -74,6 +79,8 @@ def capture_provider_response(
     raw_response: str | None = None,
     returned_model_id: str | None = None,
     upstream_provider: str | None = None,
+    generation_parameters: GenerationParameters | None = None,
+    usage: ProviderUsage | None = None,
 ) -> None:
     """Attach available response data to the current invocation, if any."""
     capture = _active_capture.get()
@@ -85,6 +92,10 @@ def capture_provider_response(
         capture.returned_model_id = returned_model_id
     if upstream_provider is not None:
         capture.upstream_provider = upstream_provider
+    if generation_parameters is not None:
+        capture.generation_parameters = generation_parameters
+    if usage is not None:
+        capture.usage = usage
 
 
 def _error_metadata(
@@ -128,6 +139,8 @@ def _publish(record: InvocationRecord, observer: InvocationObserver | None) -> N
                 "ai_error_code": record.error_code,
                 "ai_http_status_code": record.http_status_code,
                 "ai_retry_after_seconds": record.retry_after_seconds,
+                "ai_generation_parameters": asdict(record.generation_parameters) if record.generation_parameters else None,
+                "ai_usage": asdict(record.usage) if record.usage else None,
             },
         )
         if observer is not None:
@@ -185,6 +198,8 @@ def monitor_ai_call(
                     retry_after_seconds=retry_after,
                     result=result,
                     raw_response=raw_response,
+                    generation_parameters=capture.generation_parameters,
+                    usage=capture.usage,
                 )
                 _publish(record, self.invocation_observer)
 

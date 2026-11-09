@@ -50,6 +50,7 @@ class DemoTests(unittest.TestCase):
             "call_id", "operation", "provider", "model_id", "requested_model_id",
             "returned_model_id", "duration_ms", "outcome", "error_code",
             "http_status_code", "retry_after_seconds",
+            "generation_parameters", "usage",
         }
         for record in report["invocations"]:
             self.assertEqual(set(record), allowed)

@@ -24,6 +24,7 @@ from taip.ai_integration.response_codec import parse_extraction_response, parse_
 from taip.ai_integration.response_schema import (
     extraction_json_schema, groq_response_schema, solution_json_schema,
 )
+from taip.ai_integration.telemetry import GenerationParameters, parse_provider_usage
 from taip.common.timetable_contracts import (
     ExtractionProposal, OriginalProblem, TimetableProblemSnapshot, TimetableSolution,
 )
@@ -124,6 +125,7 @@ class TimetableAIAdapter(ABC):
 
     @monitor_ai_call("extract")
     def extract(self, problem: OriginalProblem) -> ExtractionProposal:
+        self._capture_generation_parameters()
         completion = self._request(build_extraction_prompt(problem), extraction_json_schema())
         capture_provider_response(
             raw_response=completion.text, returned_model_id=completion.returned_model_id,
@@ -133,6 +135,7 @@ class TimetableAIAdapter(ABC):
 
     @monitor_ai_call("solve")
     def solve(self, snapshot: TimetableProblemSnapshot) -> TimetableSolution:
+        self._capture_generation_parameters()
         if snapshot.model_id != self.model_id:
             raise AIResponseError("model_mismatch", "$.model_id", "Snapshot belongs to another model.")
         completion = self._request(build_solution_prompt(snapshot), solution_json_schema())
@@ -141,6 +144,13 @@ class TimetableAIAdapter(ABC):
             upstream_provider=completion.upstream_provider,
         )
         return parse_solution_response(completion.text, snapshot=snapshot, model_id=self.model_id)
+
+    def _capture_generation_parameters(self) -> None:
+        capture_provider_response(generation_parameters=GenerationParameters(
+            temperature=self._config.temperature,
+            max_output_tokens=self._config.max_output_tokens,
+            use_json_schema=self._config.use_json_schema,
+        ))
 
     def _post(self, url: str, headers: dict[str, str], body: dict[str, object]) -> dict[str, object]:
         response = self._transport.post(
@@ -154,6 +164,7 @@ class TimetableAIAdapter(ABC):
         capture_provider_response(
             returned_model_id=model if isinstance(model, str) and model.strip() else None,
             upstream_provider=upstream if isinstance(upstream, str) and upstream.strip() else None,
+            usage=parse_provider_usage(self._config.provider, envelope),
         )
         if "error" in envelope:
             _raise_envelope_error(envelope["error"])
