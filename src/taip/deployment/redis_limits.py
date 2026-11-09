@@ -2,8 +2,9 @@
 
 The caller owns the synchronous Redis client and its connection pool. Server
 TIME, rather than worker clocks, controls every rolling window and lease. An
-admitted operation must finish within ``lease_seconds``; expired permits cannot
-be revived. The deployment must prohibit eviction of these quota keys.
+admitted operation must finish within ``lease_seconds``. Expired permits may
+complete accounting but cannot revive admission. The deployment must prohibit
+eviction of these quota keys.
 """
 
 from collections.abc import Hashable
@@ -74,19 +75,28 @@ def _encode_key(key: Hashable) -> bytes:
 
 
 class RedisRateLimitPermit:
-    """A replay-safe distributed reservation; successful finish is idempotent."""
+    """A replay-safe reservation whose completion never authorizes new HTTP.
 
-    __slots__ = ("_limiter", "_keys", "_reservation_id")
+    Finish accepts server dispositions ``finished``, ``expired_finished``
+    (accounting only, without reviving a lease), or ``retired`` (server time
+    proves all original retention and possible cooldown horizons elapsed).
+    Missing state before that issued deadline and corrupt state fail closed.
+    All three dispositions are terminal and preserve existing quota counters.
+    """
 
-    def __init__(self, limiter: "RedisRateLimiter", keys: tuple[str, ...], reservation_id: str):
+    __slots__ = ("_limiter", "_keys", "_reservation_id", "_retire_after_ms")
+
+    def __init__(self, limiter: "RedisRateLimiter", keys: tuple[str, ...], reservation_id: str,
+                 retire_after_ms: int):
         self._limiter = limiter
         self._keys = keys
         self._reservation_id = reservation_id
+        self._retire_after_ms = retire_after_ms
 
     def finish(
         self, *, actual_tokens: int | None = None, cooldown_seconds: float | None = None,
     ) -> None:
-        self._limiter._finish(self._keys, self._reservation_id,
+        self._limiter._finish(self._keys, self._reservation_id, self._retire_after_ms,
                               actual_tokens=actual_tokens, cooldown_seconds=cooldown_seconds)
 
 
@@ -158,7 +168,7 @@ class RedisRateLimiter:
             raise AIProviderError(result["code"], retry_after_seconds=result["retry_after_seconds"])
         if result["status"] != "admitted":
             raise _unavailable() from None
-        return RedisRateLimitPermit(self, keys, operation_id)
+        return RedisRateLimitPermit(self, keys, operation_id, result["retire_after_ms"])
 
     def snapshot(self, key: Hashable) -> QuotaSnapshot:
         result = self._execute(self._keys(key), "snapshot")
@@ -167,7 +177,7 @@ class RedisRateLimiter:
         return result["snapshot"]
 
     def _finish(
-        self, keys: tuple[str, ...], reservation_id: str, *, actual_tokens: int | None,
+        self, keys: tuple[str, ...], reservation_id: str, retire_after_ms: int, *, actual_tokens: int | None,
         cooldown_seconds: float | None,
     ) -> None:
         actual = str(actual_tokens) if _integer(actual_tokens) else ""
@@ -178,8 +188,8 @@ class RedisRateLimiter:
                     duration = str(math.ceil(cooldown_seconds * 1000))
             except OverflowError:
                 pass
-        result = self._execute(keys, "finish", "", reservation_id, actual, duration)
-        if result["status"] != "finished":
+        result = self._execute(keys, "finish", "", reservation_id, actual, duration, str(retire_after_ms))
+        if result["status"] not in {"finished", "expired_finished", "retired"}:
             raise _unavailable() from None
 
     def _execute(self, keys: tuple[str, ...], operation: str, *arguments: str) -> dict[str, Any]:
@@ -197,14 +207,24 @@ class RedisRateLimiter:
         if type(raw) not in (str, bytes):
             raise ValueError
         result = json.loads(raw)
-        fields = {"version", "status", "code", "retry_after_seconds", "snapshot", "events"}
+        fields = {"version", "status", "code", "retry_after_seconds", "snapshot", "events",
+                  "retire_after_ms"}
         if (type(result) is not dict or set(result) != fields
-                or type(result["version"]) is not int or result["version"] != 1):
+                or type(result["version"]) is not int or result["version"] != 2):
             raise ValueError
         status = result.get("status")
         allowed = {"acquire": {"admitted", "denied", "conflict", "unavailable"},
-                   "finish": {"finished", "unavailable"}, "snapshot": {"snapshot", "unavailable"}}
+                   "finish": {"finished", "expired_finished", "retired", "unavailable"},
+                   "snapshot": {"snapshot", "unavailable"}}
         if status not in allowed[operation]:
+            raise ValueError
+        retirement = result["retire_after_ms"]
+        if status == "admitted":
+            retirement = _wire_integer(retirement)
+            if retirement <= 0:
+                raise ValueError
+            result["retire_after_ms"] = retirement
+        elif retirement is not None:
             raise ValueError
         data = result.get("snapshot")
         if type(data) is not dict or set(data) != {

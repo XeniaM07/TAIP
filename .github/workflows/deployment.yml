@@ -2,6 +2,7 @@ name: Deployment contracts
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 

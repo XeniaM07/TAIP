@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from taip.ai_integration.constraint_parameters import CONSTRAINT_PARAMETER_TYPES
 from taip.ai_integration.errors import AIResponseError
-from taip.ai_integration.request_guard import validate_domain_input, validate_lesson_budget
+from taip.ai_integration.request_guard import measure_request, validate_domain_input, validate_lesson_budget
 from taip.common.timetable_contracts import (
     ExtractionProposal,
     LessonAssignment,
@@ -155,10 +155,21 @@ def _value(annotation: object, value: object, path: str) -> object:
 def decode_timetable_data(value: object) -> TimetableData:
     """Reuse strict canonical shape and resource checks at trusted API seams."""
     validate_domain_input(value, max_bytes=65536)
+    measure_request(_object(value, "$.data"), max_bytes=65536)
     data = _record(TimetableData, value, "$.data")
     validate_lesson_budget(data)
     validate_domain_input(data, max_bytes=65536)
     return data
+
+
+def _public_result_budget(payload: dict[str, object], maximum: int) -> None:
+    """Reserve room for all three current model results in a bounded session."""
+    try:
+        measure_request(payload, max_bytes=maximum)
+    except AIResponseError as error:
+        if error.code == "input_too_large":
+            raise AIResponseError("resource_limit", "$", "AI result exceeds the supported public result budget.") from None
+        raise
 
 
 def parse_extraction_response(
@@ -177,6 +188,7 @@ def parse_extraction_response(
             required={"data"},
             path="$",
         )
+        _public_result_budget(payload, 131072)
         data = decode_timetable_data(payload["data"])
         missing = _value(
             tuple[MissingInformation, ...], payload.get("missing_information", []),
@@ -211,6 +223,7 @@ def parse_solution_response(
         validate_lesson_budget(snapshot.data)
         payload = _load(raw_response)
         _members(payload, allowed={"assignments"}, required={"assignments"}, path="$")
+        _public_result_budget(payload, 262144)
         assignments = _value(tuple[LessonAssignment, ...], payload["assignments"], "$.assignments")
         return TimetableSolution(
             solution_id=str(uuid4()), snapshot_id=snapshot.snapshot_id,

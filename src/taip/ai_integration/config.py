@@ -20,7 +20,8 @@ class ProviderKind(str, Enum):
 
 
 def _require_string(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
+    if (not isinstance(value, str) or not value or value != value.strip()
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)):
         raise AIConfigurationError(name)
     return value
 
@@ -55,6 +56,12 @@ class ProviderConfig:
     def __post_init__(self) -> None:
         for name in ("model_id", "api_model_id", "api_key"):
             _require_string(getattr(self, name), name)
+        for name, maximum in (("model_id", 128), ("api_model_id", 512), ("api_key", 4096)):
+            try:
+                if len(getattr(self, name).encode("utf-8")) > maximum:
+                    raise AIConfigurationError(name)
+            except UnicodeError:
+                raise AIConfigurationError(name) from None
         if not isinstance(self.provider, ProviderKind):
             raise AIConfigurationError("provider")
         if not _is_finite_number(self.timeout_seconds) or self.timeout_seconds <= 0:
@@ -67,6 +74,8 @@ class ProviderConfig:
                 raise AIConfigurationError(name)
         if type(self.use_json_schema) is not bool:
             raise AIConfigurationError("use_json_schema")
+        if self.max_response_bytes > 1048576:
+            raise AIConfigurationError("max_response_bytes")
         if not isinstance(self.rate_limits, RateLimitPolicy):
             raise AIConfigurationError("rate_limits")
 
@@ -182,6 +191,7 @@ def load_provider_configs(
                 **controls,
             )
         except AIConfigurationError as error:
-            raise AIConfigurationError(control_fields[error.field]) from None
+            field_name = {"api_model_id": f"{prefix}_MODEL", "api_key": f"{prefix}_API_KEY"}.get(error.field)
+            raise AIConfigurationError(field_name or control_fields.get(error.field, error.field)) from None
         configs.append(config)
     return tuple(configs)

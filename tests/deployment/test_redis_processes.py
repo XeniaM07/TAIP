@@ -280,6 +280,28 @@ class RealRedisProcessTests(unittest.TestCase):
         self.assertEqual((snapshot.requests_in_day, snapshot.tokens_in_minute, snapshot.in_flight),
                          (2, 10, 0))
 
+    def test_expired_lease_accepts_accounting_once_and_cannot_replay_admission(self):
+        limiter = RedisRateLimiter(self.client, namespace=self.namespace, lease_seconds=0.05)
+        policy = RateLimitPolicy(max_concurrent=1)
+        permit = limiter.acquire(_KEY, policy=policy, estimated_tokens=10, provider="integration",
+                                  model_id="logical-test", acquisition_id="expired-accounting")
+        deadline = time.monotonic() + 3
+        while limiter.snapshot(_KEY).in_flight:
+            if time.monotonic() >= deadline:
+                self.fail("Redis did not expire the accounting test's short lease.")
+            time.sleep(0.02)
+        permit.finish(actual_tokens=3, cooldown_seconds=2)
+        permit.finish(actual_tokens=999, cooldown_seconds=999)
+        snapshot = limiter.snapshot(_KEY)
+        self.assertEqual((snapshot.requests_in_day, snapshot.tokens_in_minute, snapshot.in_flight),
+                         (1, 3, 0))
+        self.assertGreater(snapshot.cooldown_seconds, 0)
+        self.assertLessEqual(snapshot.cooldown_seconds, 2)
+        with self.assertRaises(AIProviderError) as replay:
+            limiter.acquire(_KEY, policy=policy, estimated_tokens=10, provider="integration",
+                            model_id="logical-test", acquisition_id="expired-accounting")
+        self.assertEqual(replay.exception.code, "admission_unavailable")
+
     def test_only_one_process_owns_the_core_and_heartbeat_preserves_its_lease(self):
         from taip.deployment.ownership import CoreOwnershipLease
 
