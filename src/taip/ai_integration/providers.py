@@ -14,6 +14,9 @@ from taip.ai_integration.errors import (
     AIConfigurationError, AIProviderError, AIResponseError, provider_error_for_status,
 )
 from taip.ai_integration.http_transport import JSONTransport
+from taip.ai_integration.monitoring import (
+    InvocationObserver, capture_provider_response, monitor_ai_call,
+)
 from taip.ai_integration.prompts import (
     PromptMessages, build_extraction_prompt, build_solution_prompt,
 )
@@ -61,19 +64,41 @@ def _raise_envelope_error(error: object) -> None:
     raise AIProviderError("provider_error")
 
 
+def _gemini_text(candidate: dict[str, object]) -> str | None:
+    content = candidate.get("content")
+    if not isinstance(content, dict) or not isinstance(content.get("parts"), list):
+        return None
+    text_parts = []
+    for part in content["parts"]:
+        if not isinstance(part, dict) or type(part.get("thought", False)) is not bool:
+            return None
+        if part.get("thought", False):
+            continue
+        if not isinstance(part.get("text"), str):
+            return None
+        text_parts.append(part["text"])
+    return "".join(text_parts)
+
+
 class TimetableAIAdapter(ABC):
     """Share canonical operations while concrete subclasses adapt REST formats."""
 
-    __slots__ = ("_config", "_transport")
+    __slots__ = ("_config", "_transport", "_observer")
     _provider_kind: ProviderKind
 
-    def __init__(self, config: ProviderConfig, transport: JSONTransport) -> None:
+    def __init__(
+        self, config: ProviderConfig, transport: JSONTransport, *,
+        observer: InvocationObserver | None = None,
+    ) -> None:
         if not isinstance(config, ProviderConfig):
             raise AIConfigurationError("config")
         if config.provider is not self._provider_kind:
             raise AIConfigurationError("provider")
+        if observer is not None and not callable(observer):
+            raise AIConfigurationError("observer")
         self._config = config
         self._transport = transport
+        self._observer = observer
 
     @property
     def model_id(self) -> str:
@@ -83,14 +108,36 @@ class TimetableAIAdapter(ABC):
     def config(self) -> ProviderConfig:
         return self._config
 
+    @property
+    def provider_name(self) -> str:
+        return self._config.provider.value
+
+    @property
+    def requested_model_id(self) -> str:
+        return self._config.api_model_id
+
+    @property
+    def invocation_observer(self) -> InvocationObserver | None:
+        return self._observer
+
+    @monitor_ai_call("extract")
     def extract(self, problem: OriginalProblem) -> ExtractionProposal:
         completion = self._request(build_extraction_prompt(problem), extraction_json_schema())
+        capture_provider_response(
+            raw_response=completion.text, returned_model_id=completion.returned_model_id,
+            upstream_provider=completion.upstream_provider,
+        )
         return parse_extraction_response(completion.text, problem=problem, model_id=self.model_id)
 
+    @monitor_ai_call("solve")
     def solve(self, snapshot: TimetableProblemSnapshot) -> TimetableSolution:
         if snapshot.model_id != self.model_id:
             raise AIResponseError("model_mismatch", "$.model_id", "Snapshot belongs to another model.")
         completion = self._request(build_solution_prompt(snapshot), solution_json_schema())
+        capture_provider_response(
+            raw_response=completion.text, returned_model_id=completion.returned_model_id,
+            upstream_provider=completion.upstream_provider,
+        )
         return parse_solution_response(completion.text, snapshot=snapshot, model_id=self.model_id)
 
     def _post(self, url: str, headers: dict[str, str], body: dict[str, object]) -> dict[str, object]:
@@ -100,6 +147,12 @@ class TimetableAIAdapter(ABC):
             max_response_bytes=self._config.max_response_bytes,
         )
         envelope = _object(response)
+        model = envelope.get("modelVersion" if self._provider_kind is ProviderKind.GEMINI else "model")
+        upstream = envelope.get("provider")
+        capture_provider_response(
+            returned_model_id=model if isinstance(model, str) and model.strip() else None,
+            upstream_provider=upstream if isinstance(upstream, str) and upstream.strip() else None,
+        )
         if "error" in envelope:
             _raise_envelope_error(envelope["error"])
         return envelope
@@ -135,6 +188,8 @@ class GeminiTimetableAdapter(TimetableAIAdapter):
         if feedback is not None and _object(feedback).get("blockReason"):
             raise AIProviderError("provider_refusal")
         candidate = _single_result(envelope.get("candidates"))
+        text = _gemini_text(candidate)
+        capture_provider_response(raw_response=text)
         reason = candidate.get("finishReason")
         if reason in ("MAX_TOKENS", "CONTINUATION"):
             raise AIProviderError("output_truncated")
@@ -142,23 +197,7 @@ class GeminiTimetableAdapter(TimetableAIAdapter):
             raise AIProviderError("provider_refusal")
         if reason != "STOP":
             raise AIProviderError("invalid_envelope")
-        parts = _object(candidate.get("content")).get("parts")
-        if not isinstance(parts, list):
-            raise AIProviderError("invalid_envelope")
-        text_parts = []
-        for value in parts:
-            part = _object(value)
-            thought = part.get("thought", False)
-            if type(thought) is not bool:
-                raise AIProviderError("invalid_envelope")
-            if thought:
-                continue
-            text = part.get("text")
-            if not isinstance(text, str):
-                raise AIProviderError("invalid_envelope")
-            text_parts.append(text)
-        text = "".join(text_parts)
-        if not text.strip():
+        if text is None or not text.strip():
             raise AIProviderError("invalid_envelope")
         return ProviderCompletion(text, _optional_string(envelope.get("modelVersion")))
 
@@ -190,6 +229,9 @@ class _ChatTimetableAdapter(TimetableAIAdapter):
             "Authorization": f"Bearer {self._config.api_key}", "Content-Type": "application/json",
         }, body)
         choice = _single_result(envelope.get("choices"))
+        partial_message = choice.get("message")
+        if isinstance(partial_message, dict) and isinstance(partial_message.get("content"), str):
+            capture_provider_response(raw_response=partial_message["content"])
         if "error" in choice:
             _raise_envelope_error(choice["error"])
         message = _object(choice.get("message"))

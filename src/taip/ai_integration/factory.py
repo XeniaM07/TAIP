@@ -8,6 +8,7 @@ from typing import ClassVar
 from taip.ai_integration.config import ProviderConfig, ProviderKind
 from taip.ai_integration.errors import AIConfigurationError
 from taip.ai_integration.http_transport import JSONTransport
+from taip.ai_integration.monitoring import InvocationObserver
 from taip.ai_integration.providers import (
     GeminiTimetableAdapter,
     GroqTimetableAdapter,
@@ -19,16 +20,22 @@ from taip.common.timetable_protocols import AIProviderPort
 class TimetableAdapterCreator(ABC):
     """Concrete creators bind one configured provider to its matching adapter."""
 
-    __slots__ = ("_config", "_transport")
+    __slots__ = ("_config", "_transport", "_observer")
     _provider_kind: ClassVar[ProviderKind]
 
-    def __init__(self, config: ProviderConfig, transport: JSONTransport) -> None:
+    def __init__(
+        self, config: ProviderConfig, transport: JSONTransport, *,
+        observer: InvocationObserver | None = None,
+    ) -> None:
         if not isinstance(config, ProviderConfig):
             raise AIConfigurationError("config")
         if config.provider is not self._provider_kind:
             raise AIConfigurationError("provider")
+        if observer is not None and not callable(observer):
+            raise AIConfigurationError("observer")
         self._config = config
         self._transport = transport
+        self._observer = observer
 
     @abstractmethod
     def create_adapter(self) -> AIProviderPort:
@@ -41,7 +48,7 @@ class GeminiTimetableAdapterCreator(TimetableAdapterCreator):
     _provider_kind = ProviderKind.GEMINI
 
     def create_adapter(self) -> GeminiTimetableAdapter:
-        return GeminiTimetableAdapter(self._config, self._transport)
+        return GeminiTimetableAdapter(self._config, self._transport, observer=self._observer)
 
 
 class GroqTimetableAdapterCreator(TimetableAdapterCreator):
@@ -49,7 +56,7 @@ class GroqTimetableAdapterCreator(TimetableAdapterCreator):
     _provider_kind = ProviderKind.GROQ
 
     def create_adapter(self) -> GroqTimetableAdapter:
-        return GroqTimetableAdapter(self._config, self._transport)
+        return GroqTimetableAdapter(self._config, self._transport, observer=self._observer)
 
 
 class OpenRouterTimetableAdapterCreator(TimetableAdapterCreator):
@@ -57,7 +64,7 @@ class OpenRouterTimetableAdapterCreator(TimetableAdapterCreator):
     _provider_kind = ProviderKind.OPENROUTER
 
     def create_adapter(self) -> OpenRouterTimetableAdapter:
-        return OpenRouterTimetableAdapter(self._config, self._transport)
+        return OpenRouterTimetableAdapter(self._config, self._transport, observer=self._observer)
 
 
 _CREATOR_TYPES: Mapping[ProviderKind, type[TimetableAdapterCreator]] = MappingProxyType({
@@ -77,8 +84,11 @@ class AIProviderFactory:
     __slots__ = ("_providers", "_model_ids")
 
     def __init__(
-        self, configs: Iterable[ProviderConfig], *, transport: JSONTransport
+        self, configs: Iterable[ProviderConfig], *, transport: JSONTransport,
+        observer: InvocationObserver | None = None,
     ) -> None:
+        if observer is not None and not callable(observer):
+            raise AIConfigurationError("observer")
         try:
             configuration_iterator = iter(configs)
         except TypeError:
@@ -89,7 +99,7 @@ class AIProviderFactory:
                 raise AIConfigurationError("config")
             if config.model_id in creators:
                 raise AIConfigurationError("model_id")
-            creators[config.model_id] = _CREATOR_TYPES[config.provider](config, transport)
+            creators[config.model_id] = _CREATOR_TYPES[config.provider](config, transport, observer=observer)
         if not creators:
             raise AIConfigurationError("providers")
         self._providers = MappingProxyType({
