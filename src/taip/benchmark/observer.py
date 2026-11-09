@@ -4,7 +4,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from taip.benchmark.models import BenchmarkResult
+from taip.benchmark.models import BenchmarkResult, TimetableComparisonReport
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +15,7 @@ class BenchmarkEvent:
     execution_id: str
     state: str
     result: BenchmarkResult | None
+    comparison_report: TimetableComparisonReport | None = None
 
 
 class BenchmarkObserver(ABC):
@@ -93,3 +94,21 @@ class BenchmarkProgressObserver(BenchmarkObserver):
 
     def update(self, event: BenchmarkEvent) -> None:
         self.events.append(event)
+
+
+class TimetableComparisonCollector(BenchmarkObserver):
+    """Collect completed timetable comparison reports exactly once."""
+
+    def __init__(self) -> None:
+        self.reports: list[TimetableComparisonReport] = []
+        self._collected_execution_ids: set[str] = set()
+
+    def update(self, event: BenchmarkEvent) -> None:
+        if (
+            event.state != "completed"
+            or event.comparison_report is None
+            or event.execution_id in self._collected_execution_ids
+        ):
+            return
+        self.reports.append(event.comparison_report)
+        self._collected_execution_ids.add(event.execution_id)

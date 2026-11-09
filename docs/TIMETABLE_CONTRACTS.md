@@ -77,6 +77,18 @@ The canonical public Protocols are in `src/taip/common/timetable_protocols.py`. 
 
 The new providers planned for the application are Gemini via Google AI Studio, Llama via Groq, and Qwen via OpenRouter. Their exact model identifiers must be confirmed when API integration is implemented. Existing `GeminiAdapter`, `OpenAIAdapter`, `ThirdModelAdapter` declarations belong to the older workflow and must not be renamed blindly.
 
+The timetable benchmark implementation provides session-bound
+`record_extraction`, `record_edit`, `record_solution`, `record_verification`,
+and `compare_runs` operations, plus deterministic JSON/CSV text exports. It
+stores immutable common-contract inputs in a transient in-memory repository,
+reports constraint extraction precision/recall/F1 separately from schedule
+validity and durations, and does not compute a global score. The existing
+`BenchmarkPort` remains available for compatibility; orchestration can pass
+verification AOP metrics through the benchmark's structural
+`VerificationAuditMetrics` type without importing verifier internals. The
+small typed reference set is defined in
+`src/taip/benchmark/reference_data.py`.
+
 ## 5. Lifecycle and isolation
 
 `OriginalProblem` → three separate `ExtractionProposal`s → three independently editable `ProblemDraft`s → explicit confirmation of each → three `TimetableProblemSnapshot`s → per-snapshot `TimetableSolution` → independent `TimetableVerificationResult` → `ComparisonRun`.
