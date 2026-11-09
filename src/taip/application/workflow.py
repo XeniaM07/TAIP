@@ -93,7 +93,7 @@ class ModelWorkspace:
         WorkflowStatus.CONFIRMED: {WorkflowStatus.DRAFT, WorkflowStatus.SOLVING, WorkflowStatus.CONFIRMED, WorkflowStatus.FAILED},
         WorkflowStatus.SOLVING: {WorkflowStatus.COMPLETED, WorkflowStatus.FAILED},
         WorkflowStatus.COMPLETED: {WorkflowStatus.DRAFT, WorkflowStatus.SOLVING, WorkflowStatus.EXTRACTING},
-        WorkflowStatus.FAILED: {WorkflowStatus.EXTRACTING, WorkflowStatus.FAILED},
+        WorkflowStatus.FAILED: {WorkflowStatus.EXTRACTING, WorkflowStatus.CONFIRMED, WorkflowStatus.FAILED},
     }
 
     def transition(self, next_status: WorkflowStatus) -> None:
@@ -342,6 +342,10 @@ class WorkflowService:
     def solve(self, session_id: str, model_id: str) -> ModelWorkspace:
         session = self.sessions.get(session_id)
         workspace = self._workspace(session, model_id)
+        # An explicit retry reuses the already confirmed immutable snapshot.
+        # Provider cooldown/admission still applies; no automatic retry occurs.
+        if workspace.status == WorkflowStatus.FAILED and workspace.snapshot is not None:
+            workspace.transition(WorkflowStatus.CONFIRMED)
         if workspace.snapshot is None or workspace.status != WorkflowStatus.CONFIRMED:
             raise ValueError("Confirm the draft before solving.")
         workspace.transition(WorkflowStatus.SOLVING)

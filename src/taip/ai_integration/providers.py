@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from urllib.parse import quote
 
-from taip.ai_integration.config import ProviderConfig, ProviderKind
+from taip.ai_integration.config import ProviderConfig, ProviderKind, provider_quota_key
 from taip.ai_integration.errors import (
     AIConfigurationError, AIProviderError, AIResponseError, provider_error_for_status,
 )
@@ -19,6 +19,10 @@ from taip.ai_integration.monitoring import (
 )
 from taip.ai_integration.prompts import (
     PromptMessages, build_extraction_prompt, build_solution_prompt,
+)
+from taip.ai_integration.rate_limits import RateLimiter, RateLimitPort
+from taip.ai_integration.request_guard import (
+    measure_request, validate_domain_input, validate_lesson_budget, validate_source_prompt,
 )
 from taip.ai_integration.response_codec import parse_extraction_response, parse_solution_response
 from taip.ai_integration.response_schema import (
@@ -86,12 +90,13 @@ def _gemini_text(candidate: dict[str, object]) -> str | None:
 class TimetableAIAdapter(ABC):
     """Share canonical operations while concrete subclasses adapt REST formats."""
 
-    __slots__ = ("_config", "_transport", "_observer")
+    __slots__ = ("_config", "_transport", "_observer", "_limiter", "_quota_key")
     _provider_kind: ProviderKind
 
     def __init__(
         self, config: ProviderConfig, transport: JSONTransport, *,
         observer: InvocationObserver | None = None,
+        limiter: RateLimitPort | None = None,
     ) -> None:
         if not isinstance(config, ProviderConfig):
             raise AIConfigurationError("config")
@@ -102,6 +107,8 @@ class TimetableAIAdapter(ABC):
         self._config = config
         self._transport = transport
         self._observer = observer
+        self._limiter = limiter if limiter is not None else RateLimiter()
+        self._quota_key = provider_quota_key(config)
 
     @property
     def model_id(self) -> str:
@@ -126,6 +133,7 @@ class TimetableAIAdapter(ABC):
     @monitor_ai_call("extract")
     def extract(self, problem: OriginalProblem) -> ExtractionProposal:
         self._capture_generation_parameters()
+        validate_source_prompt(problem.prompt, max_bytes=self._config.max_prompt_bytes)
         completion = self._request(build_extraction_prompt(problem), extraction_json_schema())
         capture_provider_response(
             raw_response=completion.text, returned_model_id=completion.returned_model_id,
@@ -138,6 +146,8 @@ class TimetableAIAdapter(ABC):
         self._capture_generation_parameters()
         if snapshot.model_id != self.model_id:
             raise AIResponseError("model_mismatch", "$.model_id", "Snapshot belongs to another model.")
+        validate_lesson_budget(snapshot.data)
+        validate_domain_input(snapshot.data, max_bytes=self._config.max_input_bytes)
         completion = self._request(build_solution_prompt(snapshot), solution_json_schema())
         capture_provider_response(
             raw_response=completion.text, returned_model_id=completion.returned_model_id,
@@ -153,22 +163,38 @@ class TimetableAIAdapter(ABC):
         ))
 
     def _post(self, url: str, headers: dict[str, str], body: dict[str, object]) -> dict[str, object]:
-        response = self._transport.post(
-            url=url, headers=headers, body=body,
-            timeout_seconds=self._config.timeout_seconds,
-            max_response_bytes=self._config.max_response_bytes,
+        size = measure_request(body, max_bytes=self._config.max_request_bytes)
+        permit = self._limiter.acquire(
+            self._quota_key, policy=self._config.rate_limits,
+            estimated_tokens=size + self._config.max_output_tokens + 128,
+            provider=self.provider_name, model_id=self.model_id,
         )
-        envelope = _object(response)
-        model = envelope.get("modelVersion" if self._provider_kind is ProviderKind.GEMINI else "model")
-        upstream = envelope.get("provider")
-        capture_provider_response(
-            returned_model_id=model if isinstance(model, str) and model.strip() else None,
-            upstream_provider=upstream if isinstance(upstream, str) and upstream.strip() else None,
-            usage=parse_provider_usage(self._config.provider, envelope),
-        )
-        if "error" in envelope:
-            _raise_envelope_error(envelope["error"])
-        return envelope
+        usage = None
+        cooldown = None
+        try:
+            response = self._transport.post(
+                url=url, headers=headers, body=body,
+                timeout_seconds=self._config.timeout_seconds,
+                max_response_bytes=self._config.max_response_bytes,
+            )
+            envelope = _object(response)
+            usage = parse_provider_usage(self._config.provider, envelope)
+            model = envelope.get("modelVersion" if self._provider_kind is ProviderKind.GEMINI else "model")
+            upstream = envelope.get("provider")
+            capture_provider_response(
+                returned_model_id=model if isinstance(model, str) and model.strip() else None,
+                upstream_provider=upstream if isinstance(upstream, str) and upstream.strip() else None,
+                usage=usage,
+            )
+            if "error" in envelope:
+                _raise_envelope_error(envelope["error"])
+            return envelope
+        except AIProviderError as error:
+            if error.code == "rate_limit":
+                cooldown = 60.0 if error.retry_after_seconds is None else error.retry_after_seconds
+            raise
+        finally:
+            permit.finish(actual_tokens=usage.total_tokens if usage else None, cooldown_seconds=cooldown)
 
     @abstractmethod
     def _request(self, messages: PromptMessages, schema: dict[str, object]) -> ProviderCompletion:

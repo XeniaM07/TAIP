@@ -81,6 +81,7 @@ class TimetableDraftValidator:
         class_ids = {item.class_id for item in data.classes}
         teacher_ids = {item.teacher_id for item in data.teachers}
         subject_ids = {item.subject_id for item in data.subjects}
+        room_ids = {room.room_id for room in data.rooms}
 
         # Teaching requirements
         for index, requirement in enumerate(data.requirements):
@@ -117,7 +118,6 @@ class TimetableDraftValidator:
                     "Sessions per week must be a positive integer.",
                     f"{path}.sessions_per_week",
                 )
-                room_ids = {room.room_id for room in data.rooms}
         slot_ids = {slot.slot_id for slot in data.time_slots}
         requirement_ids = {
             requirement.requirement_id

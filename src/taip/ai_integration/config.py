@@ -3,10 +3,12 @@
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from hashlib import sha256
 import math
 import os
 
 from taip.ai_integration.errors import AIConfigurationError
+from taip.ai_integration.rate_limits import RateLimitPolicy
 
 
 class ProviderKind(str, Enum):
@@ -43,6 +45,10 @@ class ProviderConfig:
     temperature: float = 0.0
     max_response_bytes: int = 1048576
     use_json_schema: bool = False
+    max_prompt_bytes: int = 16384
+    max_input_bytes: int = 65536
+    max_request_bytes: int = 131072
+    rate_limits: RateLimitPolicy = field(default_factory=RateLimitPolicy)
 
     def __post_init__(self) -> None:
         for name in ("model_id", "api_model_id", "api_key"):
@@ -53,12 +59,23 @@ class ProviderConfig:
             raise AIConfigurationError("timeout_seconds")
         if not _is_finite_number(self.temperature) or not 0 <= self.temperature <= 2:
             raise AIConfigurationError("temperature")
-        for name in ("max_output_tokens", "max_response_bytes"):
+        for name in ("max_output_tokens", "max_response_bytes", "max_prompt_bytes", "max_input_bytes", "max_request_bytes"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise AIConfigurationError(name)
         if type(self.use_json_schema) is not bool:
             raise AIConfigurationError("use_json_schema")
+        if not isinstance(self.rate_limits, RateLimitPolicy):
+            raise AIConfigurationError("rate_limits")
+
+
+def provider_quota_key(config: ProviderConfig) -> tuple[str, bytes]:
+    """Group aliases by service and credential without retaining a plaintext key."""
+    try:
+        fingerprint = sha256(config.api_key.encode("utf-8")).digest()
+    except UnicodeError:
+        raise AIConfigurationError("api_key") from None
+    return config.provider.value, fingerprint
 
 
 def _number_option(
@@ -83,6 +100,21 @@ def _schema_option(environment: Mapping[str, str], name: str) -> bool:
     return value == "true"
 
 
+def _rate_policy(environment: Mapping[str, str], prefix: str) -> RateLimitPolicy:
+    defaults = RateLimitPolicy()
+    controls = {
+        name: _number_option(environment, f"{prefix}_{name.upper()}", getattr(defaults, name), convert)
+        for name, convert in (
+            ("requests_per_minute", int), ("requests_per_day", int),
+            ("tokens_per_minute", int), ("max_concurrent", int), ("warning_fraction", float),
+        )
+    }
+    try:
+        return RateLimitPolicy(**controls)
+    except AIConfigurationError as error:
+        raise AIConfigurationError(f"{prefix}_{error.field.upper()}") from None
+
+
 def load_provider_configs(
     environment: Mapping[str, str] | None = None,
 ) -> tuple[ProviderConfig, ...]:
@@ -97,12 +129,18 @@ def load_provider_configs(
         "max_output_tokens": _number_option(source, "TAIP_AI_MAX_OUTPUT_TOKENS", 8192, int),
         "temperature": _number_option(source, "TAIP_AI_TEMPERATURE", 0.0, float),
         "max_response_bytes": _number_option(source, "TAIP_AI_MAX_RESPONSE_BYTES", 1048576, int),
+        "max_prompt_bytes": _number_option(source, "TAIP_AI_MAX_PROMPT_BYTES", 16384, int),
+        "max_input_bytes": _number_option(source, "TAIP_AI_MAX_INPUT_BYTES", 65536, int),
+        "max_request_bytes": _number_option(source, "TAIP_AI_MAX_REQUEST_BYTES", 131072, int),
     }
     control_fields = {
         "timeout_seconds": "TAIP_AI_TIMEOUT_SECONDS",
         "max_output_tokens": "TAIP_AI_MAX_OUTPUT_TOKENS",
         "temperature": "TAIP_AI_TEMPERATURE",
         "max_response_bytes": "TAIP_AI_MAX_RESPONSE_BYTES",
+        "max_prompt_bytes": "TAIP_AI_MAX_PROMPT_BYTES",
+        "max_input_bytes": "TAIP_AI_MAX_INPUT_BYTES",
+        "max_request_bytes": "TAIP_AI_MAX_REQUEST_BYTES",
     }
     configs = []
     for provider in ProviderKind:
@@ -110,6 +148,7 @@ def load_provider_configs(
         api_key = _require_string(source.get(f"{prefix}_API_KEY"), f"{prefix}_API_KEY")
         api_model_id = _require_string(source.get(f"{prefix}_MODEL"), f"{prefix}_MODEL")
         use_json_schema = _schema_option(source, f"{prefix}_JSON_SCHEMA")
+        rate_limits = _rate_policy(source, prefix)
         try:
             config = ProviderConfig(
                 model_id=provider.value,
@@ -117,6 +156,7 @@ def load_provider_configs(
                 api_model_id=api_model_id,
                 api_key=api_key,
                 use_json_schema=use_json_schema,
+                rate_limits=rate_limits,
                 **controls,
             )
         except AIConfigurationError as error:

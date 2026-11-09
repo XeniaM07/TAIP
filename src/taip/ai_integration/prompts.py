@@ -12,6 +12,7 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 import json
 
+from taip.ai_integration.errors import AIResponseError
 from taip.ai_integration.response_schema import (
     extraction_json_schema,
     solution_json_schema,
@@ -50,10 +51,13 @@ def _json_value(value: object) -> object:
 
 
 def _compact_json(value: object) -> str:
-    return json.dumps(
-        value, default=_json_value, ensure_ascii=False, separators=(",", ":"),
-        allow_nan=False,
-    )
+    try:
+        return json.dumps(
+            value, default=_json_value, ensure_ascii=False, separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise AIResponseError("invalid_request", "$", "Input cannot be serialized safely.") from None
 
 
 def build_extraction_prompt(problem: OriginalProblem) -> PromptMessages:

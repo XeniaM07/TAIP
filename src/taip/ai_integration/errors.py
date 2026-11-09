@@ -38,7 +38,7 @@ class AIProviderError(RuntimeError):
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
         self.retryable = code in {
-            "timeout", "network_error", "rate_limit", "provider_unavailable",
+            "timeout", "network_error", "rate_limit", "provider_unavailable", "local_rate_limit",
         }
         super().__init__(f"AI provider failure ({code}).")
 
