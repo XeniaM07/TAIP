@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 
-const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000/api';
+const API = import.meta.env.VITE_API_URL || '/api';
 const MODEL_IDS = ['model-a', 'model-b', 'model-c'];
 
 async function request(path, options = {}) {

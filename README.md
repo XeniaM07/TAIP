@@ -63,6 +63,18 @@ npm run dev
 
 Open `http://localhost:5173`. API docs are at `http://127.0.0.1:8000/docs`. The workflow is create session → extract draft → edit/save → confirm → solve → verify; the comparison panel summarizes all three independent model workspaces. The JSON editor lets you change timetable entities and constraints. The mock extractor intentionally returns a small sample timetable for any prompt; it does not interpret natural language. Replace `MockProviderFactory` with implementations of `AIProviderPort` to connect real extractors and solvers without changing the HTTP contract. The verifier is injected through `VerificationPort`.
 
+### Run with Docker
+
+Install Docker Desktop with Compose, then run from the repository root:
+
+```powershell
+docker compose up --build
+```
+
+Open `http://localhost:8080` for the React app and `http://localhost:8000/docs` for the API. The `web` container serves the built React app and proxies `/api` to FastAPI. Stop the services with `Ctrl+C`; use `docker compose down` to remove the stopped containers and network.
+
+The regular Docker workflow does not need the Camunda demo files in `tests/camunda_demo/`; the Docker build excludes them. They remain only for the optional Camunda integration experiment and are not part of this app's startup path.
+
 ### Architecture and monitoring
 
 `WorkflowService` is the application Facade. It receives the session repository, provider factory, and verifier through interfaces. Each model has its own draft, confirmed snapshot, solution, verification result, timing, and lifecycle state. The API exposes only session-scoped operations; UUID session identifiers are unguessable references, not user authentication. `InMemorySessionRepository` uses a lock for concurrent access and removes inactive sessions during repository access. Logging around workflow operations records identifiers, state changes, durations, and outcomes without logging problem text. The existing `TimetableVerifier` uses the `monitored_verify` decorator as an AOP-style cross-cutting concern and records verification duration and findings.
