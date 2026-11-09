@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 
 const API = import.meta.env.VITE_API_URL || '/api';
-const MODEL_IDS = ['model-a', 'model-b', 'model-c'];
+const MODEL_IDS = ['gemini-mock', 'groq-llama-mock', 'openrouter-qwen-mock'];
+const MODEL_LABELS = {
+  'gemini-mock': 'Gemini · mock',
+  'groq-llama-mock': 'Groq Llama · mock',
+  'openrouter-qwen-mock': 'OpenRouter Qwen · mock',
+};
 
 async function request(path, options = {}) {
   const response = await fetch(`${API}${path}`, {
@@ -14,7 +19,7 @@ async function request(path, options = {}) {
 }
 
 export default function App() {
-  const [prompt, setPrompt] = useState('Create a simple two-class mathematics timetable for Monday.');
+  const [prompt, setPrompt] = useState('Loading the documented mock example…');
   const [session, setSession] = useState(null);
   const [selectedModel, setSelectedModel] = useState(MODEL_IDS[0]);
   const [draftText, setDraftText] = useState('');
@@ -22,6 +27,10 @@ export default function App() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const workspace = session?.models?.[selectedModel];
+
+  useEffect(() => {
+    request('/mock/demo-prompt').then((result) => setPrompt(result.prompt)).catch((err) => setError(err.message));
+  }, []);
 
   async function action(label, callback) {
     setBusy(true); setError(''); setNotice('');
@@ -92,9 +101,11 @@ export default function App() {
           <div className="privacy-note"><span>◉</span><p>Session is isolated and held in memory. It expires after 2 hours of inactivity.</p></div>
         </aside>
         <section className="panel main-panel"><div className="section-heading"><span className="step">02</span><div><h2>Review &amp; solve</h2><p>Each model keeps its own draft and results.</p></div></div>
-          <div className="model-row"><label htmlFor="model">Model workspace</label><select id="model" value={selectedModel} onChange={(e) => selectModel(e.target.value)}>{MODEL_IDS.map((id, i) => <option key={id} value={id}>Model {String.fromCharCode(65 + i)} · Mock provider</option>)}</select><span className={`status-chip ${workspace?.status?.toLowerCase() || ''}`}>{workspace?.status || 'PENDING'}</span></div>
+          <div className="model-row"><label htmlFor="model">Model workspace</label><select id="model" value={selectedModel} onChange={(e) => selectModel(e.target.value)}>{MODEL_IDS.map((id) => <option key={id} value={id}>{MODEL_LABELS[id]}</option>)}</select><span className={`status-chip ${workspace?.status?.toLowerCase() || ''}`}>{workspace?.status || 'PENDING'}</span></div>
           <div className="toolbar"><button className="button secondary" disabled={!session || busy} onClick={() => action('Selected draft extracted', extract)}>Extract selected</button><button className="button secondary" disabled={!session || busy} onClick={() => action('Drafts extracted for all models', extractAll)}>Extract all</button><button className="button secondary" disabled={!workspace?.draft || busy} onClick={() => action('Draft saved', saveDraft)}>Save edits</button><button className="button primary" disabled={!workspace?.draft || busy} onClick={() => action('Snapshot confirmed', () => modelAction('confirm'))}>Confirm</button><button className="button solve" disabled={workspace?.status !== 'CONFIRMED' || busy} onClick={() => action('Solution generated', () => modelAction('solve'))}>Solve <span>→</span></button></div>
           <label htmlFor="draft" className="editor-label">Constraint &amp; timetable editor <span>JSON · edit entities and constraints</span></label><textarea id="draft" className="code-editor" value={draftText} onChange={(e) => setDraftText(e.target.value)} spellCheck="false" placeholder="Extract a draft to edit timetable data." disabled={!workspace?.draft}/>
+          {workspace?.proposal?.missing_information?.length > 0 && <div className="verification FAILED"><strong>Mock extraction needs explicit data</strong>{workspace.proposal.missing_information.map((item) => <small key={item.code}>{item.message}</small>)}</div>}
+          {workspace?.proposal?.unsupported_requirements?.length > 0 && <div className="verification FAILED"><strong>Unsupported requirements</strong>{workspace.proposal.unsupported_requirements.map((item) => <small key={item}>{item}</small>)}</div>}
           <div className="solution-heading"><div><h3>Generated timetable</h3><p>Assignments from the selected model</p></div>{workspace?.solution && <button className="button text-button" disabled={busy} onClick={() => action('Verification complete', () => modelAction('verify'))}>Verify solution ↗</button>}</div>
           <div className="table-wrap"><table><thead><tr><th>Class</th><th>Subject</th><th>Day</th><th>Period</th><th>Room</th></tr></thead><tbody>{assignments.map((assignment, i) => { const req = lookup.requirements[assignment.requirement_id]; const slot = lookup.slots[assignment.slot_id]; return <tr key={`${assignment.requirement_id}-${assignment.occurrence}`}><td>{lookup.classes[req?.class_id] || req?.class_id || '—'}</td><td>{lookup.subjects[req?.subject_id] || req?.subject_id || '—'}</td><td>{slot?.day || '—'}</td><td>{slot?.period ?? '—'}</td><td>{lookup.rooms[assignment.room_id] || assignment.room_id}</td></tr>; })}{assignments.length === 0 && <tr><td colSpan="5" className="empty-cell">Your timetable will appear here after solving.</td></tr>}</tbody></table></div>
           {workspace?.verification && <div className={`verification ${workspace.verification.status}`}><strong>Verification: {workspace.verification.status}</strong><span>{workspace.verification.violations.length ? `${workspace.verification.violations.length} violation(s)` : 'No constraint violations found.'}</span>{workspace.verification.violations.map((v, i) => <small key={i}>{v.message}</small>)}</div>}
@@ -108,11 +119,12 @@ export default function App() {
 
 function Comparison({ sessionId, refresh, version }) {
   const [rows, setRows] = useState([]);
+  const [report, setReport] = useState(null);
   const [error, setError] = useState('');
   useEffect(() => { load(); }, [sessionId, version]);
   async function load() {
-    try { const result = await request(`/sessions/${sessionId}/compare`); setRows(result.models); setError(''); }
+    try { const result = await request(`/sessions/${sessionId}/compare`); setRows(result.models); setReport(result.report); setError(''); }
     catch (err) { setError(err.message); }
   }
-  return <section className="panel compare-panel"><div className="solution-heading"><div><span className="step">03</span><div><h2>Model comparison</h2><p>Compare extraction, solving and independent verification.</p></div></div><button className="button secondary" onClick={async () => { await refresh(); await load(); }}>Refresh comparison</button></div>{error && <p className="error-text">{error}</p>}<div className="table-wrap"><table><thead><tr><th>Model</th><th>Draft</th><th>Snapshot</th><th>Solution</th><th>Verification</th><th>Extract ms</th><th>Solve ms</th></tr></thead><tbody>{rows.map((row) => <tr key={row.model_id}><td>{row.model_id}</td><td>{row.proposal_id ? 'Ready' : '—'}</td><td>{row.snapshot_id ? 'Confirmed' : '—'}</td><td>{row.solution_id ? 'Generated' : '—'}</td><td>{row.verification_status || '—'}</td><td>{row.extraction_duration_ms ?? '—'}</td><td>{row.solving_duration_ms ?? '—'}</td></tr>)}</tbody></table></div></section>;
+  return <section className="panel compare-panel"><div className="solution-heading"><div><span className="step">03</span><div><h2>Model comparison</h2><p>Extraction evidence, corrections, validity, and timings by model.</p></div></div><button className="button secondary" onClick={async () => { await refresh(); await load(); }}>Refresh comparison</button></div>{error && <p className="error-text">{error}</p>}{report && <div className="privacy-note"><span>i</span><p>{report.snapshots_comparable === true ? 'Runs use the same confirmed snapshot.' : report.snapshots_comparable === false ? 'Runs use different confirmed snapshots; per-model verification metrics must not be read as a direct solve-quality comparison.' : 'Snapshots are not available for comparison yet.'} {report.notes.join(' ')}</p></div>}<div className="table-wrap"><table><thead><tr><th>Model</th><th>Corrections</th><th>Hard violations</th><th>Soft penalty</th><th>Extraction F1</th><th>Verify</th><th>Total ms</th></tr></thead><tbody>{(report?.rows || []).map((row) => <tr key={row.model_id}><td>{MODEL_LABELS[row.model_id] || row.model_id}</td><td>{row.edit_count}</td><td>{row.hard_violation_count}</td><td>{row.soft_penalty ?? '—'}</td><td>{row.extraction_constraints ? row.extraction_constraints.f1.toFixed(2) : 'Unavailable'}</td><td>{row.verification_status || '—'}</td><td>{row.total_duration_ms ?? '—'}</td></tr>)}{(!report || report.rows.length === 0) && <tr><td colSpan="7" className="empty-cell">Extract model drafts to begin comparison.</td></tr>}</tbody></table></div></section>;
 }

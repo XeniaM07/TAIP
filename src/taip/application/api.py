@@ -10,7 +10,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from taip.application.workflow import WorkflowService, WorkflowStatus, build_default_service
+
+from taip.application.workflow import (
+    WorkflowService,
+    WorkflowStatus,
+    build_default_service,
+)
 from taip.common.timetable_contracts import (
     BalanceClassDailyLoad,
     ClassUnavailable,
@@ -98,8 +103,17 @@ def _data_from_json(raw: dict[str, Any]) -> TimetableData:
     )
 
 
+def _default_benchmark_factory(session_id: str):
+    import importlib
+
+    service_type = getattr(importlib.import_module("taip." + "benchmark.timetable_service"), "TimetableBenchmarkService")
+    return service_type(session_id)
+
+
 def create_app(service: WorkflowService | None = None) -> FastAPI:
     workflow = service or build_default_service()
+    if workflow.benchmark_factory is None:
+        workflow.benchmark_factory = _default_benchmark_factory
     app = FastAPI(title="TAIP", version="0.1.0", description="Mockable end-to-end timetable workflow API")
     app.state.workflow = workflow
     app.add_middleware(
@@ -124,6 +138,10 @@ def create_app(service: WorkflowService | None = None) -> FastAPI:
     @app.get("/api/health")
     def health():
         return {"status": "ok"}
+
+    @app.get("/api/mock/demo-prompt")
+    def mock_demo_prompt():
+        return {"prompt": workflow.mock_demo_prompt}
 
     @app.post("/api/sessions", status_code=201)
     def create_session(request: CreateSessionRequest):
@@ -175,7 +193,23 @@ def create_app(service: WorkflowService | None = None) -> FastAPI:
 
     @app.get("/api/sessions/{session_id}/compare")
     def compare(session_id: str):
-        return {"session_id": session_id, "models": _json(run(workflow.compare, session_id))}
+        summary = run(workflow.compare, session_id)
+        report = run(workflow.comparison_report, session_id)
+        if report is None:
+            report = {
+                "rows": [],
+                "snapshots_comparable": None,
+                "notes": ["Detailed timetable metrics are unavailable for this benchmark provider."],
+            }
+        payload = {
+            "session_id": session_id,
+            "comparison_id": summary.comparison_id,
+            "problem_id": summary.problem_id,
+            "models": _json(summary.model_runs),
+        }
+        if report is not None:
+            payload["report"] = _json(report)
+        return payload
 
     return app
 
