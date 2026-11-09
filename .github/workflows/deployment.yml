@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: deployment-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   offline-and-real-redis:
     runs-on: ubuntu-24.04
@@ -70,6 +74,9 @@ jobs:
         run: |
           docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml stop redis
           uv run --no-sync python -m tests.deployment.smoke_public --directory "$RUNNER_TEMP/taip-public" --expect-redis-unavailable
+      - name: Show bounded container diagnostics after a failure
+        if: failure() && steps.bootstrap.outcome == 'success'
+        run: docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml logs --no-color --tail 100 core gateway redis web caddy
       - name: Stop the ephemeral stack
         if: always() && steps.bootstrap.outcome == 'success'
         run: docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml down --remove-orphans

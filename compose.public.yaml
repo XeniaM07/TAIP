@@ -9,7 +9,7 @@ x-python: &python
   read_only: true
   cap_drop: [ALL]
   security_opt: [no-new-privileges:true]
-  tmpfs: [/tmp:size=64m,mode=1777]
+  tmpfs: ["/tmp:size=64m,mode=1777"]
   restart: unless-stopped
   init: true
   pids_limit: 128
@@ -53,7 +53,7 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    tmpfs: [/tmp:size=16m,mode=1777]
+    tmpfs: ["/tmp:size=16m,mode=1777"]
     restart: unless-stopped
     pids_limit: 64
     mem_limit: 384m
@@ -131,9 +131,9 @@ services:
     sysctls:
       net.ipv4.ip_unprivileged_port_start: "0"
     tmpfs:
-      - /var/cache/nginx:size=32m,uid=101,gid=101,mode=0700
-      - /var/run:size=1m,uid=101,gid=101,mode=0700
-      - /tmp:size=16m,mode=1777
+      - "/var/cache/nginx:size=32m,uid=101,gid=101,mode=0700"
+      - "/var/run:size=1m,uid=101,gid=101,mode=0700"
+      - "/tmp:size=16m,mode=1777"
     restart: unless-stopped
     pids_limit: 64
     mem_limit: 128m
@@ -149,7 +149,7 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    tmpfs: [/tmp:size=32m,mode=1777]
+    tmpfs: ["/tmp:size=32m,mode=1777"]
     restart: unless-stopped
     pids_limit: 64
     mem_limit: 256m

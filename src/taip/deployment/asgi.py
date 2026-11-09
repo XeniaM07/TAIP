@@ -3,6 +3,9 @@
 import asyncio
 import json
 import math
+from typing import NoReturn
+
+from starlette.types import Receive, Scope, Send
 
 from taip.ai_integration.errors import AIResponseError
 from taip.ai_integration.request_guard import validate_domain_input
@@ -16,7 +19,7 @@ class RequestRejected(Exception):
         super().__init__(code)
 
 
-async def read_body(scope, receive, *, max_bytes: int, timeout_seconds: float) -> bytes:
+async def read_body(scope: Scope, receive: Receive, *, max_bytes: int, timeout_seconds: float) -> bytes:
     lengths = [value for key, value in scope.get("headers", ()) if key.lower() == b"content-length"]
     encodings = [value for key, value in scope.get("headers", ()) if key.lower() == b"transfer-encoding"]
     if encodings and (lengths or len(encodings) != 1 or encodings[0].lower() != b"chunked"):
@@ -49,7 +52,7 @@ async def read_body(scope, receive, *, max_bytes: int, timeout_seconds: float) -
     return bytes(body)
 
 
-def _object(pairs):
+def _object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result = {}
     for key, value in pairs:
         if key in result:
@@ -58,7 +61,7 @@ def _object(pairs):
     return result
 
 
-def _constant(value):
+def _constant(value: str) -> NoReturn:
     raise ValueError
 
 
@@ -75,7 +78,8 @@ def validate_json_payload(body: bytes, max_bytes: int) -> object:
         raise RequestRejected(400, "invalid_request") from None
 
 
-async def send_json(send, status: int, code: str, *, retry_after_seconds=None, challenge=None):
+async def send_json(send: Send, status: int, code: str, *, retry_after_seconds: float | None = None,
+                    challenge: str | None = None) -> None:
     body = json.dumps({"code": code}, separators=(",", ":")).encode("ascii")
     headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
                (b"cache-control", b"no-store"), (b"x-content-type-options", b"nosniff")]

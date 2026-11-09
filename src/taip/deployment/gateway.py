@@ -4,6 +4,7 @@ import asyncio
 from urllib.parse import unquote, urlsplit
 
 import httpx
+from starlette.types import Receive, Scope, Send
 
 from taip.ai_integration.errors import AIProviderError
 from taip.ai_integration.rate_limits import RateLimitPolicy, RateLimitPort
@@ -18,7 +19,8 @@ _RESPONSE_HEADERS = {b"content-type", b"content-language", b"content-disposition
 
 
 class ProtectedGateway:
-    def __init__(self, settings, limiter, client, redis_client=None):
+    def __init__(self, settings: DeploymentSettings, limiter: RateLimitPort,
+                 client: httpx.AsyncClient, redis_client=None) -> None:
         self.settings = settings
         self._limiter = limiter
         self._client = client
@@ -31,7 +33,7 @@ class ProtectedGateway:
                                        max_concurrent=settings.http_max_concurrent,
                                        tokens_per_minute=1000000000)
 
-    async def __call__(self, scope, receive, send):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
             await self._lifespan(receive, send)
             return
@@ -67,7 +69,7 @@ class ProtectedGateway:
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": b"" if scope["method"] == "HEAD" else body})
 
-    def _validate_target(self, scope):
+    def _validate_target(self, scope: Scope) -> tuple[bytes, bytes]:
         headers = scope.get("headers", ())
         if len(headers) > 100 or sum(len(k) + len(v) for k, v in headers) > 16384:
             raise asgi.RequestRejected(431, "headers_too_large")
@@ -91,7 +93,7 @@ class ProtectedGateway:
             raise asgi.RequestRejected(400, "invalid_target")
         return raw, query
 
-    async def _handle(self, scope, receive):
+    async def _handle(self, scope: Scope, receive: Receive) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
         if self._closed:
             raise asgi.RequestRejected(503, "gateway_unavailable")
         if scope.get("path") == "/healthz" and scope["method"] in ("GET", "HEAD"):
@@ -153,7 +155,7 @@ class ProtectedGateway:
             except Exception:
                 raise asgi.RequestRejected(503, "admission_unavailable") from None
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
@@ -161,7 +163,7 @@ class ProtectedGateway:
         if self._redis is not None:
             await asyncio.to_thread(self._redis.close)
 
-    async def _lifespan(self, receive, send):
+    async def _lifespan(self, receive: Receive, send: Send) -> None:
         while True:
             message = await receive()
             if message["type"] == "lifespan.startup":
@@ -180,7 +182,7 @@ class ProtectedGateway:
 
 
 def create_gateway_app(settings: DeploymentSettings | None = None, *, limiter: RateLimitPort | None = None,
-                       transport=None, redis_client=None):
+                       transport: httpx.AsyncBaseTransport | None = None, redis_client=None) -> ProtectedGateway:
     settings = load_deployment_settings() if settings is None else settings
     owned_client = None
     if limiter is None:

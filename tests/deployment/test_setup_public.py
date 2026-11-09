@@ -4,8 +4,10 @@ from contextlib import redirect_stdout
 from hashlib import sha256
 from importlib import import_module, util
 import io
+import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -86,6 +88,28 @@ class PublicSetupTests(unittest.TestCase):
     def test_default_origin_keeps_the_nonstandard_https_port(self):
         config = self.module.prepare_deployment(self.directory)
         self.assertIn("TAIP_PUBLIC_ORIGIN=https://localhost:8443\n", config.read_text())
+
+    @unittest.skipUnless(shutil.which("docker"), "Docker CLI is needed to parse Compose")
+    def test_compose_tmpfs_options_remain_with_each_absolute_mount(self):
+        config = self.module.prepare_deployment(self.directory)
+        compose = Path(__file__).resolve().parents[2] / "compose.public.yaml"
+        rendered = subprocess.run(
+            ["docker", "compose", "--env-file", str(config), "-f", str(compose),
+             "config", "--format", "json"],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        services = json.loads(rendered.stdout)["services"]
+        for service, expected_count in (("core", 1), ("gateway", 1), ("redis", 1), ("web", 3), ("caddy", 1)):
+            with self.subTest(service=service):
+                mounts = services[service]["tmpfs"]
+                self.assertEqual(len(mounts), expected_count)
+                for mount in mounts:
+                    target, separator, options = mount.partition(":")
+                    self.assertTrue(target.startswith("/"), "tmpfs target must be absolute")
+                    self.assertEqual(separator, ":")
+                    expected_mode = "mode=1777" if target == "/tmp" else "mode=0700"
+                    self.assertIn(expected_mode, options.split(","))
 
     def test_bind_address_defaults_to_loopback_and_accepts_only_explicit_ip_addresses(self):
         config = self.module.prepare_deployment(self.directory)
