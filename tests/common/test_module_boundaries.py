@@ -16,6 +16,12 @@ ALLOWED_DEPENDENCIES = {
         "mathematical_verification",
         "orchestration",
     },
+    "application": {
+        "application",
+        "common",
+        "mathematical_verification",
+        "problem_management",
+    },
 }
 
 
