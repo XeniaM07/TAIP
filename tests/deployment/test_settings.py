@@ -125,11 +125,19 @@ class DeploymentSettingsTests(unittest.TestCase):
         for field in (
             "max_body_bytes", "max_response_bytes", "gateway_workers",
             "http_requests_per_minute", "http_requests_per_day", "http_max_concurrent",
+            "http_ingress_requests_per_minute", "http_ingress_max_concurrent",
         ):
             for value in (0, -1, True, False, 1.0, "2", None):
                 with self.subTest(field=field, value=value), self.assertRaises(self.error) as caught:
                     self.settings(**{field: value})
                 self.assertEqual(caught.exception.field, field)
+
+    def test_ingress_policy_limits_local_pending_admission_work(self):
+        for field, value in (("http_ingress_requests_per_minute", 1000001),
+                             ("http_ingress_max_concurrent", 33)):
+            with self.subTest(field=field), self.assertRaises(self.error) as caught:
+                self.settings(**{field: value})
+            self.assertEqual(caught.exception.field, field)
 
     def test_body_and_response_caps_reject_unbounded_policy(self):
         for field in ("max_body_bytes", "max_response_bytes"):
@@ -262,6 +270,7 @@ class DeploymentSettingsTests(unittest.TestCase):
             TAIP_REDIS_LEASE_SECONDS="30", TAIP_GATEWAY_WORKERS="3",
             TAIP_HTTP_REQUESTS_PER_MINUTE="20", TAIP_HTTP_REQUESTS_PER_DAY="200",
             TAIP_HTTP_MAX_CONCURRENT="4", TAIP_LIVE_AI="true", TAIP_TLS_TERMINATED_BY_PROXY="true",
+            TAIP_HTTP_INGRESS_REQUESTS_PER_MINUTE="80", TAIP_HTTP_INGRESS_MAX_CONCURRENT="3",
         )
         self.assertEqual(settings.basic_username, "team")
         self.assertEqual(settings.core_url, "https://core:8443")
@@ -275,6 +284,8 @@ class DeploymentSettingsTests(unittest.TestCase):
                           settings.redis_lease_seconds), (3.5, 12, 30))
         self.assertEqual((settings.gateway_workers, settings.http_requests_per_minute,
                           settings.http_requests_per_day, settings.http_max_concurrent), (3, 20, 200, 4))
+        self.assertEqual((settings.http_ingress_requests_per_minute,
+                          settings.http_ingress_max_concurrent), (80, 3))
         self.assertIs(settings.live_ai, True)
         self.assertIs(settings.trust_tls_proxy, True)
 

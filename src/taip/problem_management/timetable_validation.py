@@ -17,6 +17,7 @@ from taip.common.timetable_protocols import (
     DraftValidationResult,
     ValidationIssue,
 )
+from taip.common.timetable_integrity import iter_timetable_integrity_issues
 
 
 class TimetableDraftValidator:
@@ -24,7 +25,7 @@ class TimetableDraftValidator:
 
     def validate(self, draft: ProblemDraft) -> DraftValidationResult:
         data = draft.data
-        issues: list[ValidationIssue] = []
+        issues: list[ValidationIssue] = list(iter_timetable_integrity_issues(data))
 
         def add_issue(code: str, message: str, path: str) -> None:
             issues.append(ValidationIssue(code, message, path))
@@ -108,16 +109,6 @@ class TimetableDraftValidator:
                     f"{path}.subject_id",
                 )
 
-            if (
-                not isinstance(requirement.sessions_per_week, int)
-                or isinstance(requirement.sessions_per_week, bool)
-                or requirement.sessions_per_week <= 0
-            ):
-                add_issue(
-                    "INVALID_SESSIONS",
-                    "Sessions per week must be a positive integer.",
-                    f"{path}.sessions_per_week",
-                )
         slot_ids = {slot.slot_id for slot in data.time_slots}
         requirement_ids = {
             requirement.requirement_id

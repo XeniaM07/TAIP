@@ -1,6 +1,7 @@
 """Stateless authenticated gateway; all mutable workflows stay in one core."""
 
 import asyncio
+from time import monotonic
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -10,6 +11,7 @@ from taip.ai_integration.errors import AIProviderError
 from taip.ai_integration.rate_limits import RateLimitPolicy, RateLimitPort
 from taip.deployment import asgi
 from taip.deployment.auth import CredentialVerifier, origin_is_allowed
+from taip.deployment.ingress import IngressPort, LocalIngressLimiter, RedisIngressLimiter
 from taip.deployment.settings import DeploymentSettings, load_deployment_settings
 
 
@@ -20,12 +22,16 @@ _RESPONSE_HEADERS = {b"content-type", b"content-language", b"content-disposition
 
 class ProtectedGateway:
     def __init__(self, settings: DeploymentSettings, limiter: RateLimitPort,
-                 client: httpx.AsyncClient, redis_client=None) -> None:
+                 client: httpx.AsyncClient, redis_client=None, *, ingress: IngressPort | None = None) -> None:
         self.settings = settings
         self._limiter = limiter
         self._client = client
         self._redis = redis_client
         self._closed = False
+        self._ingress = ingress if ingress is not None else LocalIngressLimiter(
+            requests_per_minute=settings.http_ingress_requests_per_minute)
+        self._ingress_slots = asyncio.BoundedSemaphore(settings.http_ingress_max_concurrent)
+        self._ingress_retry_until = 0.0
         self._auth = CredentialVerifier(settings.access_token_digest, basic_username=settings.basic_username)
         self._authority = urlsplit(settings.public_origin).netloc.encode("ascii")
         self._policy = RateLimitPolicy(requests_per_minute=settings.http_requests_per_minute,
@@ -96,20 +102,28 @@ class ProtectedGateway:
     async def _handle(self, scope: Scope, receive: Receive) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
         if self._closed:
             raise asgi.RequestRejected(503, "gateway_unavailable")
-        if scope.get("path") == "/healthz" and scope["method"] in ("GET", "HEAD"):
+        remaining = self._ingress_retry_until - monotonic()
+        if remaining > 0:
+            raise asgi.RequestRejected(429, "local_rate_limit", remaining)
+        # Reject rather than enqueue admission I/O in the thread executor.
+        # acquire() below cannot yield while this semaphore has a free slot.
+        if self._ingress_slots.locked():
+            raise asgi.RequestRejected(429, "local_rate_limit", 1)
+        async with self._ingress_slots:
             try:
-                await asyncio.to_thread(self._limiter.snapshot, _KEY)
-            except Exception:
-                raise asgi.RequestRejected(503, "admission_unavailable") from None
-            return 200, [(b"content-type", b"application/json")], b'{"status":"ok"}'
-        raw, query = self._validate_target(scope)
-        try:
-            permit = await asyncio.to_thread(self._limiter.acquire, _KEY, policy=self._policy,
-                                             estimated_tokens=1, provider="api", model_id="gateway")
-        except AIProviderError as error:
-            raise asgi.RequestRejected(429 if error.code == "local_rate_limit" else 503,
-                                       error.code, error.retry_after_seconds) from None
-        try:
+                await asyncio.to_thread(self._ingress.check)
+            except AIProviderError as error:
+                if error.code == "local_rate_limit" and error.retry_after_seconds is not None:
+                    self._ingress_retry_until = monotonic() + min(60, error.retry_after_seconds)
+                raise asgi.RequestRejected(429 if error.code == "local_rate_limit" else 503,
+                                           error.code, error.retry_after_seconds) from None
+            if scope.get("path") == "/healthz" and scope["method"] in ("GET", "HEAD"):
+                try:
+                    await asyncio.to_thread(self._limiter.snapshot, _KEY)
+                except Exception:
+                    raise asgi.RequestRejected(503, "admission_unavailable") from None
+                return 200, [(b"content-type", b"application/json")], b'{"status":"ok"}'
+            raw, query = self._validate_target(scope)
             headers = scope.get("headers", ())
             if self._auth.authenticate(headers) is None:
                 raise asgi.RequestRejected(401, "authentication_required")
@@ -117,6 +131,13 @@ class ProtectedGateway:
             if not origin_is_allowed(scope["method"], headers, scheme=scheme,
                                      expected_origin=self.settings.public_origin):
                 raise asgi.RequestRejected(403, "origin_not_allowed")
+            try:
+                permit = await asyncio.to_thread(self._limiter.acquire, _KEY, policy=self._policy,
+                                                 estimated_tokens=1, provider="api", model_id="gateway")
+            except AIProviderError as error:
+                raise asgi.RequestRejected(429 if error.code == "local_rate_limit" else 503,
+                                           error.code, error.retry_after_seconds) from None
+        try:
             body = await asgi.read_body(scope, receive, max_bytes=self.settings.max_body_bytes,
                                         timeout_seconds=self.settings.body_timeout_seconds)
             core = scope["path"] == "/api" or scope["path"].startswith("/api/")
@@ -182,7 +203,8 @@ class ProtectedGateway:
 
 
 def create_gateway_app(settings: DeploymentSettings | None = None, *, limiter: RateLimitPort | None = None,
-                       transport: httpx.AsyncBaseTransport | None = None, redis_client=None) -> ProtectedGateway:
+                       transport: httpx.AsyncBaseTransport | None = None, redis_client=None,
+                       ingress: IngressPort | None = None) -> ProtectedGateway:
     settings = load_deployment_settings() if settings is None else settings
     owned_client = None
     if limiter is None:
@@ -191,7 +213,11 @@ def create_gateway_app(settings: DeploymentSettings | None = None, *, limiter: R
         owned_client = create_redis_client(settings.redis) if redis_client is None else None
         limiter = RedisRateLimiter(redis_client if redis_client is not None else owned_client,
                                    namespace=settings.redis.namespace + ":http", lease_seconds=settings.redis_lease_seconds)
+    ingress_client = redis_client if redis_client is not None else owned_client
+    if ingress is None and ingress_client is not None:
+        ingress = RedisIngressLimiter(ingress_client, namespace=settings.redis.namespace,
+                                       requests_per_minute=settings.http_ingress_requests_per_minute)
     client = httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False,
                                timeout=settings.request_timeout_seconds,
                                limits=httpx.Limits(max_connections=settings.http_max_concurrent, max_keepalive_connections=16))
-    return ProtectedGateway(settings, limiter, client, owned_client)
+    return ProtectedGateway(settings, limiter, client, owned_client, ingress=ingress)

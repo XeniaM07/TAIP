@@ -26,14 +26,26 @@ local function snapshot()
             cooldown_seconds=math.max(0, cooldown-now)/1000}
 end
 
-local function reply(status, code, retry)
+local function reply(status, code, retry, retire_after)
     if policy then
         redis.call('SET', KEYS[7], poisoned and 'unavailable' or integer(total))
         local ttl = math.max(day + policy[10] + minute, cooldown-now+day)
         for _, key in ipairs(KEYS) do redis.call('PEXPIRE', key, math.ceil(ttl)) end
     end
-    return cjson.encode({version=1, status=status, code=code or cjson.null,
-                         retry_after_seconds=retry or cjson.null, snapshot=snapshot(), events=events})
+    return cjson.encode({version=2, status=status, code=code or cjson.null,
+                         retry_after_seconds=retry or cjson.null, snapshot=snapshot(), events=events,
+                         retire_after_ms=retire_after and integer(retire_after) or cjson.null})
+end
+
+local function can_retire()
+    -- The successful admission reply issued this immutable server deadline.
+    -- A whole missing bucket before then can indicate eviction, never expiry.
+    -- The extra possible cooldown horizon is deliberately conservative: every
+    -- admitted operation must complete within its configured lease.
+    local deadline, duration = tonumber(ARGV[6]), tonumber(ARGV[5]) or 0
+    return deadline and deadline > 0 and deadline <= max_integer and
+           deadline == math.floor(deadline) and duration >= 0 and
+           duration <= max_integer - deadline and now >= deadline + duration
 end
 
 local function event(kind, dimension, used, limit, retry, provider, model, log)
@@ -63,7 +75,9 @@ if not bound then
         if redis.call('EXISTS', KEYS[i]) == 1 then return reply('unavailable') end
     end
     if operation == 'snapshot' then return reply('snapshot') end
-    if operation == 'finish' then return reply('unavailable') end
+    if operation == 'finish' then
+        return reply(can_retire() and 'retired' or 'unavailable')
+    end
 else
     policy = cjson.decode(bound)
     local rawtotal = redis.call('GET', KEYS[7])
@@ -123,12 +137,16 @@ if operation == 'snapshot' then return reply('snapshot') end
 if operation == 'finish' then
     local id = ARGV[3]
     local raw = redis.call('HGET', KEYS[5], id)
-    if not raw then return reply('unavailable') end
+    if not raw then return reply(can_retire() and 'retired' or 'unavailable') end
     local record = cjson.decode(raw)
     if record.s == 'f' then return reply('finished') end
-    if record.s ~= 'a' then return reply('unavailable') end
-    local deadline = tonumber(redis.call('ZSCORE', KEYS[4], id))
-    if not deadline or deadline <= now then return reply('unavailable') end
+    if record.s == 'x' then return reply('expired_finished') end
+    local expired = record.s == 'l'
+    if record.s ~= 'a' and not expired then return reply('unavailable') end
+    if not expired then
+        local deadline = tonumber(redis.call('ZSCORE', KEYS[4], id))
+        if not deadline or deadline <= now then return reply('unavailable') end
+    end
     local charge = 0
     if record.a+minute > now then
         charge = tonumber(ARGV[4] ~= '' and ARGV[4] or record.e)
@@ -147,7 +165,9 @@ if operation == 'finish' then
         record.t = integer(charge)
         redis.call('ZADD', KEYS[6], record.a+minute, id)
     end
-    record.s = 'f'
+    -- Expired completion is accounting only. Its ID can never replay an
+    -- admission, even though subsequent accounting completion is idempotent.
+    record.s = expired and 'x' or 'f'
     redis.call('HSET', KEYS[5], id, cjson.encode(record))
     local duration = tonumber(ARGV[5])
     if duration and duration > 0 and now+duration > cooldown then
@@ -156,7 +176,7 @@ if operation == 'finish' then
         event('cooldown', 'cooldown', 0, 0, duration/1000, record.p, record.m, true)
     end
     warnings(record.p, record.m, true)
-    return reply('finished')
+    return reply(expired and 'expired_finished' or 'finished')
 end
 
 if operation ~= 'acquire' then return reply('unavailable') end
@@ -169,7 +189,9 @@ if bound then
         if tonumber(record.e) ~= estimate or record.p ~= provider or record.m ~= model then
             return reply('unavailable')
         end
-        if record.s == 'a' or record.s == 'f' then return reply('admitted') end
+        if record.s == 'a' or record.s == 'f' then
+            return reply('admitted', nil, nil, record.a+day+policy[10])
+        end
         return reply('unavailable')
     end
 end
@@ -223,4 +245,4 @@ redis.call('HSET', KEYS[5], id, cjson.encode(record))
 redis.call('ZADD', KEYS[11], now+day+policy[10], id)
 total = total+estimate
 warnings(provider, model, true)
-return reply('admitted')
+return reply('admitted', nil, nil, now+day+policy[10])

@@ -37,6 +37,8 @@ class InvocationRecord:
     raw_response: str | None = field(default=None, repr=False)
     generation_parameters: GenerationParameters | None = None
     usage: ProviderUsage | None = None
+    settlement_pending: bool = False
+    settlement_warning: str | None = None
 
 
 InvocationObserver = Callable[[InvocationRecord], None]
@@ -63,6 +65,7 @@ class _ResponseCapture:
     upstream_provider: str | None = None
     generation_parameters: GenerationParameters | None = None
     usage: ProviderUsage | None = None
+    settlement_pending: bool = False
 
 
 _active_capture: ContextVar[_ResponseCapture | None] = ContextVar(
@@ -98,6 +101,13 @@ def capture_provider_response(
         capture.usage = usage
 
 
+def capture_quota_settlement_pending() -> None:
+    """Flag accounting uncertainty without changing the provider's outcome."""
+    capture = _active_capture.get()
+    if capture is not None:
+        capture.settlement_pending = True
+
+
 def _error_metadata(
     error: BaseException | None,
 ) -> tuple[str | None, int | None, float | None]:
@@ -124,7 +134,7 @@ def _publish(record: InvocationRecord, observer: InvocationObserver | None) -> N
     token = _active_capture.set(None)
     try:
         _log_safely(
-            logging.INFO,
+            logging.WARNING if record.settlement_pending else logging.INFO,
             "ai.invocation",
             extra={
                 "ai_call_id": record.call_id,
@@ -141,6 +151,8 @@ def _publish(record: InvocationRecord, observer: InvocationObserver | None) -> N
                 "ai_retry_after_seconds": record.retry_after_seconds,
                 "ai_generation_parameters": asdict(record.generation_parameters) if record.generation_parameters else None,
                 "ai_usage": asdict(record.usage) if record.usage else None,
+                "ai_settlement_pending": record.settlement_pending,
+                "ai_settlement_warning": record.settlement_warning,
             },
         )
         if observer is not None:
@@ -200,6 +212,8 @@ def monitor_ai_call(
                     raw_response=raw_response,
                     generation_parameters=capture.generation_parameters,
                     usage=capture.usage,
+                    settlement_pending=capture.settlement_pending,
+                    settlement_warning="quota_settlement_pending" if capture.settlement_pending else None,
                 )
                 _publish(record, self.invocation_observer)
 

@@ -105,7 +105,7 @@ class RedisRateLimitTests(unittest.TestCase):
         first.finish(actual_tokens=0)
         self.assertEqual(self.limiter.snapshot(self.key), QuotaSnapshot(1, 1, 90, 0, 0.0))
 
-    def test_lease_expiry_recovers_capacity_and_lost_finish_fails_closed(self):
+    def test_lease_expiry_recovers_capacity_and_late_finish_does_not_touch_new_lease(self):
         limiter = self.module.RedisRateLimiter(self.client, lease_seconds=100)
         policy = self.policy(max_concurrent=1)
         first = self.acquire(limiter=limiter, policy=policy, tokens=80)
@@ -113,9 +113,8 @@ class RedisRateLimitTests(unittest.TestCase):
         self.now += 100
         self.assertEqual(limiter.snapshot(self.key), QuotaSnapshot(0, 1, 0, 0, 0.0))
         self.acquire(limiter=limiter, policy=policy)
-        with self.assertRaises(AIProviderError) as caught:
-            first.finish(actual_tokens=0)
-        self.assertEqual(caught.exception.code, "admission_unavailable")
+        first.finish(actual_tokens=0)
+        self.assertEqual(limiter.snapshot(self.key), QuotaSnapshot(1, 2, 10, 1, 0.0))
 
     def test_policy_binds_only_after_admission_and_conflicts_across_instances(self):
         policy = self.policy(tokens_per_minute=100)
@@ -172,8 +171,9 @@ class RedisRateLimitTests(unittest.TestCase):
         self.denied("admission_unavailable", limiter=limiter)
 
     def test_protocol_missing_required_fields_and_unknown_status_fail_closed(self):
-        complete = {"version": 1, "status": "admitted", "code": None,
+        complete = {"version": 2, "status": "admitted", "code": None,
                     "retry_after_seconds": None,
+                    "retire_after_ms": "1000087300000",
                     "snapshot": {"requests_in_minute": 1, "requests_in_day": 1,
                                  "tokens_in_minute": 10, "in_flight": 1, "cooldown_seconds": 0},
                     "events": []}
@@ -184,7 +184,10 @@ class RedisRateLimitTests(unittest.TestCase):
             responses.append(modified)
         responses.extend(({**complete, "status": "unexpected"},
                           {**complete, "version": True},
+                          {**complete, "version": 1},
                           {**complete, "code": "unexpected"}))
+        responses.extend({**complete, "retire_after_ms": value}
+                         for value in (None, True, 0, -1, "0", "01", "9007199254740992"))
         for response in responses:
             with self.subTest(response=response):
                 class InvalidClient:
@@ -218,6 +221,89 @@ class RedisRateLimitTests(unittest.TestCase):
         self.denied(limiter=limiter, policy=policy, tokens=21)
         self.now += 50
         self.acquire(limiter=limiter, policy=policy, tokens=80)
+
+    def test_late_accounting_settles_expired_lease_without_authorizing_id_replay(self):
+        limiter = self.module.RedisRateLimiter(self.client, lease_seconds=1)
+        permit = self.acquire(limiter=limiter, tokens=80, acquisition_id="expired-attempt")
+        self.now += 2
+        self.assertEqual(limiter.snapshot(self.key), QuotaSnapshot(1, 1, 80, 0, 0.0))
+
+        permit.finish(actual_tokens=7, cooldown_seconds=10)
+
+        self.assertEqual(limiter.snapshot(self.key), QuotaSnapshot(1, 1, 7, 0, 10.0))
+        permit.finish(actual_tokens=999, cooldown_seconds=999)
+        self.assertEqual(limiter.snapshot(self.key), QuotaSnapshot(1, 1, 7, 0, 10.0))
+        self.denied("admission_unavailable", limiter=limiter, tokens=80,
+                    acquisition_id="expired-attempt")
+        self.now += 10
+        self.acquire(limiter=limiter, tokens=10).finish(actual_tokens=0)
+        self.assertEqual(limiter.snapshot(self.key), QuotaSnapshot(2, 2, 7, 0, 0.0))
+
+    def test_forgotten_admission_has_terminal_finish_after_server_retention(self):
+        for previously_finished in (False, True):
+            with self.subTest(previously_finished=previously_finished):
+                key = ("groq", f"retirement-{previously_finished}")
+                limiter = self.module.RedisRateLimiter(self.client, lease_seconds=1)
+                permit = limiter.acquire(
+                    key, policy=self.policy(), estimated_tokens=80, provider="groq", model_id="logical-a",
+                )
+                if previously_finished:
+                    permit.finish(actual_tokens=7)
+                self.now += 86402
+                self.assertEqual(limiter.snapshot(key), QuotaSnapshot(0, 0, 0, 0, 0.0))
+                permit.finish(actual_tokens=7)
+                self.assertEqual(limiter.snapshot(key), QuotaSnapshot(0, 0, 0, 0, 0.0))
+                limiter.acquire(key, policy=self.policy(), estimated_tokens=10,
+                                provider="groq", model_id="logical-a").finish(actual_tokens=3)
+                self.assertEqual(limiter.snapshot(key), QuotaSnapshot(1, 1, 3, 0, 0.0))
+
+    def test_missing_bucket_before_issued_retention_is_not_terminal(self):
+        permit = self.acquire()
+        self.client.flushdb()
+        self.now += 61
+        with self.assertRaises(AIProviderError) as caught:
+            permit.finish(actual_tokens=0)
+        self.assertEqual(caught.exception.code, "admission_unavailable")
+
+    def test_complete_normal_bucket_expiration_is_terminal_only_after_server_deadline(self):
+        permit = self.acquire()
+        self.now += 87400
+        self.assertEqual(self.client.keys(), [])
+        permit.finish(actual_tokens=7)
+        self.assertEqual(self.limiter.snapshot(self.key), QuotaSnapshot(0, 0, 0, 0, 0.0))
+
+    def test_retirement_waits_for_possible_long_cooldown_and_never_clears_existing_cooldown(self):
+        limiter = self.module.RedisRateLimiter(self.client, lease_seconds=1)
+        permit = self.acquire(limiter=limiter)
+        self.now += 86402
+        limiter.snapshot(self.key)
+        with self.assertRaises(AIProviderError) as caught:
+            permit.finish(cooldown_seconds=90000)
+        self.assertEqual(caught.exception.code, "admission_unavailable")
+        self.now += 90000
+        active = self.acquire(limiter=limiter)
+        active.finish(cooldown_seconds=100)
+        permit.finish(cooldown_seconds=90000)
+        self.assertEqual(limiter.snapshot(self.key).cooldown_seconds, 100)
+        self.denied(limiter=limiter)
+
+    def test_partial_eviction_and_poison_remain_unavailable_after_retention(self):
+        for corruption in ("policy", "tokens"):
+            with self.subTest(corruption=corruption):
+                key = ("groq", f"corrupt-{corruption}")
+                permit = self.limiter.acquire(key, policy=self.policy(), estimated_tokens=80,
+                                              provider="groq", model_id="logical-a")
+                keys = self.limiter._keys(key)
+                for stored in keys:
+                    self.client.persist(stored)
+                if corruption == "policy":
+                    self.client.delete(keys[0])
+                else:
+                    self.client.set(keys[6], "unavailable")
+                self.now += 87400
+                with self.assertRaises(AIProviderError) as caught:
+                    permit.finish(actual_tokens=7)
+                self.assertEqual(caught.exception.code, "admission_unavailable")
 
     def test_observer_failure_and_reentry_cannot_change_atomic_admission(self):
         calls = []

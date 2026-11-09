@@ -175,6 +175,8 @@ class DeploymentSettings:
     http_requests_per_minute: int = 120
     http_requests_per_day: int = 5000
     http_max_concurrent: int = 16
+    http_ingress_requests_per_minute: int = 600
+    http_ingress_max_concurrent: int = 8
     live_ai: bool = False
     trust_tls_proxy: bool = False
 
@@ -193,6 +195,8 @@ class DeploymentSettings:
             _positive_integer(getattr(self, name), name, maximum=_MAX_PAYLOAD_BYTES)
         for name in ("gateway_workers", "http_requests_per_minute", "http_requests_per_day", "http_max_concurrent"):
             _positive_integer(getattr(self, name), name)
+        _positive_integer(self.http_ingress_requests_per_minute, "http_ingress_requests_per_minute", maximum=1000000)
+        _positive_integer(self.http_ingress_max_concurrent, "http_ingress_max_concurrent", maximum=32)
         for name in ("body_timeout_seconds", "request_timeout_seconds", "redis_lease_seconds"):
             _positive_number(getattr(self, name), name)
         # Connect/read timeouts are two seconds each. Leave ten additional
@@ -295,6 +299,8 @@ def load_deployment_settings(
         http_requests_per_minute=integer("TAIP_HTTP_REQUESTS_PER_MINUTE", "http_requests_per_minute", "120"),
         http_requests_per_day=integer("TAIP_HTTP_REQUESTS_PER_DAY", "http_requests_per_day", "5000"),
         http_max_concurrent=integer("TAIP_HTTP_MAX_CONCURRENT", "http_max_concurrent", "16"),
+        http_ingress_requests_per_minute=integer("TAIP_HTTP_INGRESS_REQUESTS_PER_MINUTE", "http_ingress_requests_per_minute", "600"),
+        http_ingress_max_concurrent=integer("TAIP_HTTP_INGRESS_MAX_CONCURRENT", "http_ingress_max_concurrent", "8"),
         live_ai=boolean("TAIP_LIVE_AI", "live_ai"),
         trust_tls_proxy=boolean("TAIP_TLS_TERMINATED_BY_PROXY", "trust_tls_proxy"),
     )
