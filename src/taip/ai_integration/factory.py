@@ -1,0 +1,108 @@
+"""Factory Method creators for the canonical timetable AI provider boundary."""
+
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping
+from types import MappingProxyType
+from typing import ClassVar
+
+from taip.ai_integration.config import ProviderConfig, ProviderKind
+from taip.ai_integration.errors import AIConfigurationError
+from taip.ai_integration.http_transport import JSONTransport
+from taip.ai_integration.providers import (
+    GeminiTimetableAdapter,
+    GroqTimetableAdapter,
+    OpenRouterTimetableAdapter,
+)
+from taip.common.timetable_protocols import AIProviderPort
+
+
+class TimetableAdapterCreator(ABC):
+    """Concrete creators bind one configured provider to its matching adapter."""
+
+    __slots__ = ("_config", "_transport")
+    _provider_kind: ClassVar[ProviderKind]
+
+    def __init__(self, config: ProviderConfig, transport: JSONTransport) -> None:
+        if not isinstance(config, ProviderConfig):
+            raise AIConfigurationError("config")
+        if config.provider is not self._provider_kind:
+            raise AIConfigurationError("provider")
+        self._config = config
+        self._transport = transport
+
+    @abstractmethod
+    def create_adapter(self) -> AIProviderPort:
+        """Build the provider behind the canonical interface."""
+        ...
+
+
+class GeminiTimetableAdapterCreator(TimetableAdapterCreator):
+    __slots__ = ()
+    _provider_kind = ProviderKind.GEMINI
+
+    def create_adapter(self) -> GeminiTimetableAdapter:
+        return GeminiTimetableAdapter(self._config, self._transport)
+
+
+class GroqTimetableAdapterCreator(TimetableAdapterCreator):
+    __slots__ = ()
+    _provider_kind = ProviderKind.GROQ
+
+    def create_adapter(self) -> GroqTimetableAdapter:
+        return GroqTimetableAdapter(self._config, self._transport)
+
+
+class OpenRouterTimetableAdapterCreator(TimetableAdapterCreator):
+    __slots__ = ()
+    _provider_kind = ProviderKind.OPENROUTER
+
+    def create_adapter(self) -> OpenRouterTimetableAdapter:
+        return OpenRouterTimetableAdapter(self._config, self._transport)
+
+
+_CREATOR_TYPES: Mapping[ProviderKind, type[TimetableAdapterCreator]] = MappingProxyType({
+    ProviderKind.GEMINI: GeminiTimetableAdapterCreator,
+    ProviderKind.GROQ: GroqTimetableAdapterCreator,
+    ProviderKind.OPENROUTER: OpenRouterTimetableAdapterCreator,
+})
+
+
+class AIProviderFactory:
+    """Expose eager, stable adapters while the caller owns the shared transport.
+
+    Construction validates the full configuration before creating any adapter.
+    Model lookups never substitute another model or perform a network request.
+    """
+
+    __slots__ = ("_providers", "_model_ids")
+
+    def __init__(
+        self, configs: Iterable[ProviderConfig], *, transport: JSONTransport
+    ) -> None:
+        try:
+            configuration_iterator = iter(configs)
+        except TypeError:
+            raise AIConfigurationError("providers") from None
+        creators: dict[str, TimetableAdapterCreator] = {}
+        for config in configuration_iterator:
+            if not isinstance(config, ProviderConfig):
+                raise AIConfigurationError("config")
+            if config.model_id in creators:
+                raise AIConfigurationError("model_id")
+            creators[config.model_id] = _CREATOR_TYPES[config.provider](config, transport)
+        if not creators:
+            raise AIConfigurationError("providers")
+        self._providers = MappingProxyType({
+            model_id: creator.create_adapter() for model_id, creator in creators.items()
+        })
+        self._model_ids = tuple(self._providers)
+
+    @property
+    def MODEL_IDS(self) -> tuple[str, ...]:
+        """Configured logical aliases in the caller's explicit order."""
+        return self._model_ids
+
+    def get_provider(self, model_id: str) -> AIProviderPort:
+        if not isinstance(model_id, str) or model_id not in self._providers:
+            raise KeyError("The requested AI model is not configured.")
+        return self._providers[model_id]
