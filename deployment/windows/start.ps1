@@ -143,6 +143,20 @@ function Get-TaipComposeArguments {
     return ,$arguments
 }
 
+function Test-TaipCertificateTrusted {
+    param([Parameter(Mandatory=$true)][string]$Thumbprint)
+    # Windows PowerShell's Cert: provider can miss a trusted certificate in -File mode.
+    # Reopen the read-only store for every check to obtain a fresh exact view.
+    $store = New-Object -TypeName Security.Cryptography.X509Certificates.X509Store -ArgumentList @(
+        [Security.Cryptography.X509Certificates.StoreName]::Root,
+        [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+    )
+    try {
+        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly -bor [Security.Cryptography.X509Certificates.OpenFlags]::OpenExistingOnly)
+        return ($store.Certificates.Find([Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint, $Thumbprint, $false).Count -gt 0)
+    } finally { $store.Dispose() }
+}
+
 function Ensure-TaipCertificate {
     param([string]$PrivateDirectory, [int]$TimeoutSeconds = 60)
     $path = Join-Path $PrivateDirectory 'caddy-data\caddy\pki\authorities\local\root.crt'
@@ -158,8 +172,7 @@ function Ensure-TaipCertificate {
         if ($ca.Count -ne 1 -or -not $ca[0].CertificateAuthority -or $certificate.Subject -ne $certificate.Issuer -or $certificate.NotBefore -gt $now -or $certificate.NotAfter -le $now) {
             throw 'The generated local HTTPS certificate is invalid.'
         }
-        $storePath = 'Cert:\CurrentUser\Root\' + $certificate.Thumbprint
-        if (-not (Test-Path -LiteralPath $storePath)) {
+        if (-not (Test-TaipCertificateTrusted -Thumbprint $certificate.Thumbprint)) {
             Write-Host 'Trusting this local Caddy certificate for the current Windows user...'
             try {
                 $import = Invoke-TaipProcess -FilePath (Join-Path $env:SystemRoot 'System32\certutil.exe') -Arguments @('-user', '-addstore', 'Root', $path) -TimeoutSeconds 30
@@ -171,7 +184,7 @@ function Ensure-TaipCertificate {
                 if ($detail.Length -gt 1200) { $detail = $detail.Substring($detail.Length - 1200) }
                 throw "Could not trust the local HTTPS certificate for the current Windows user (certutil exit code $($import.ExitCode)). Check Windows certificate store permissions. $detail"
             }
-            if (-not (Test-Path -LiteralPath $storePath)) {
+            if (-not (Test-TaipCertificateTrusted -Thumbprint $certificate.Thumbprint)) {
                 throw 'The exact local HTTPS certificate is missing from the current Windows user trust store after import. Check Windows certificate permissions and retry.'
             }
         }

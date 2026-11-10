@@ -50,13 +50,37 @@ try {
 $script:Trusted=($scenario -eq 'already-trusted')
 $script:Calls=New-Object System.Collections.Generic.List[object]
 $script:StorePaths=New-Object System.Collections.Generic.List[string]
+$script:StoreThumbprints=New-Object System.Collections.Generic.List[string]
+$script:StoreFlags=New-Object System.Collections.Generic.List[int]
+$script:StoreNames=New-Object System.Collections.Generic.List[object]
+$script:DisposedStores=0
 function Test-Path {
     param($LiteralPath,$PathType)
     if ($LiteralPath -like 'Cert:\CurrentUser\Root\*') {
         $script:StorePaths.Add($LiteralPath)
-        return $script:Trusted
+        # Deliberately model a provider snapshot that misses a native import.
+        return $false
     }
     return Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType Leaf
+}
+function New-Object {
+    param($TypeName,$ArgumentList)
+    if ($TypeName -eq 'Security.Cryptography.X509Certificates.X509Store') {
+        $script:StoreNames.Add(@($ArgumentList | ForEach-Object { [string]$_ }))
+        $certificates=[pscustomobject]@{TrustedSnapshot=$script:Trusted}
+        $certificates | Add-Member -MemberType ScriptMethod -Name Find -Value {
+            param($findType,$thumbprint,$validOnly)
+            if ([string]$findType -ne 'FindByThumbprint' -or $validOnly) { throw 'Expected an exact thumbprint presence check.' }
+            $script:StoreThumbprints.Add($thumbprint)
+            return [pscustomobject]@{Count=[int]$this.TrustedSnapshot}
+        }
+        $store=[pscustomobject]@{Certificates=$certificates}
+        $store | Add-Member -MemberType ScriptMethod -Name Open -Value { param($flags) $script:StoreFlags.Add([int]$flags) }
+        $store | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $script:DisposedStores++ }
+        return $store
+    }
+    if ($TypeName -like '*X509Certificate2*') { return [Security.Cryptography.X509Certificates.X509Certificate2]::new($certificatePath) }
+    return Microsoft.PowerShell.Utility\New-Object @PSBoundParameters
 }
 function Import-Certificate { throw 'The certificate cmdlet must not be used.' }
 function Invoke-TaipProcess {
@@ -68,7 +92,7 @@ function Invoke-TaipProcess {
 }
 $message=$null
 try { Ensure-TaipCertificate -PrivateDirectory $env:TAIP_TEST_PRIVATE -TimeoutSeconds 1 6>$null } catch { $message=$_.Exception.Message }
-@{Error=$message;Calls=@($script:Calls.ToArray());StorePaths=@($script:StorePaths.ToArray());Thumbprint=$expectedThumbprint;CertificatePath=$certificatePath} | ConvertTo-Json -Compress -Depth 6
+@{Error=$message;Calls=@($script:Calls.ToArray());StorePaths=@($script:StorePaths.ToArray());StoreThumbprints=@($script:StoreThumbprints.ToArray());StoreFlags=@($script:StoreFlags.ToArray());StoreNames=@($script:StoreNames.ToArray());DisposedStores=$script:DisposedStores;Thumbprint=$expectedThumbprint;CertificatePath=$certificatePath} | ConvertTo-Json -Compress -Depth 6
 """
             completed = subprocess.run(
                 [POWERSHELL, "-NoLogo", "-NoProfile", "-NonInteractive",
@@ -91,14 +115,19 @@ try { Ensure-TaipCertificate -PrivateDirectory $env:TAIP_TEST_PRIVATE -TimeoutSe
         self.assertEqual(call["Args"], ["-user", "-addstore", "Root", result["CertificatePath"]])
         self.assertGreater(call["Timeout"], 0)
         self.assertLessEqual(call["Timeout"], 60)
-        expected = "Cert:\\CurrentUser\\Root\\" + result["Thumbprint"]
-        self.assertEqual(result["StorePaths"], [expected, expected])
+        self.assertEqual(result["StoreThumbprints"], [result["Thumbprint"], result["Thumbprint"]])
+        self.assertEqual(result["StoreNames"], [["Root", "CurrentUser"], ["Root", "CurrentUser"]])
+        self.assertEqual(result["StoreFlags"], [4, 4])  # ReadOnly | OpenExistingOnly
+        self.assertEqual(result["DisposedStores"], 2)
+        self.assertEqual(result["StorePaths"], [])
 
     def test_existing_exact_certificate_is_not_imported_again(self):
         result = self.exercise("already-trusted")
         self.assertIsNone(result["Error"])
         self.assertEqual(result["Calls"], [])
-        self.assertEqual(result["StorePaths"], ["Cert:\\CurrentUser\\Root\\" + result["Thumbprint"]])
+        self.assertEqual(result["StoreThumbprints"], [result["Thumbprint"]])
+        self.assertEqual(result["StorePaths"], [])
+        self.assertEqual(result["DisposedStores"], 1)
 
     def test_native_import_error_is_actionable_and_not_reported_as_success(self):
         result = self.exercise("native-error")
@@ -111,7 +140,8 @@ try { Ensure-TaipCertificate -PrivateDirectory $env:TAIP_TEST_PRIVATE -TimeoutSe
         result = self.exercise("not-imported")
         self.assertIsNotNone(result["Error"])
         self.assertIn("certificate", result["Error"].lower())
-        self.assertEqual(len(result["StorePaths"]), 2)
+        self.assertEqual(len(result["StoreThumbprints"]), 2)
+        self.assertEqual(result["DisposedStores"], 2)
 
     def test_invalid_ca_or_validity_period_never_reaches_import(self):
         for scenario in ("expired", "future", "not-ca", "not-self-issued"):
@@ -121,6 +151,7 @@ try { Ensure-TaipCertificate -PrivateDirectory $env:TAIP_TEST_PRIVATE -TimeoutSe
                 self.assertIn("invalid", result["Error"].lower())
                 self.assertEqual(result["Calls"], [])
                 self.assertEqual(result["StorePaths"], [])
+                self.assertEqual(result["StoreThumbprints"], [])
 
 
 if __name__ == "__main__":
