@@ -138,6 +138,43 @@ Wait-TaipReadiness -Origin 'https://localhost:8443' -AccessToken ('x'*64) -Expec
 """)
         self.assertIn("Error", result)
         self.assertIn("ready", result["Error"].lower())
+        self.assertNotIn("No AI generation was requested.", result["Error"])
+
+    def test_readiness_retries_beyond_one_minute_and_returns_when_ready(self):
+        result = self.exercise(r"""
+$script:ElapsedSeconds=0; $script:Requests=0; $script:Sleeps=0
+Update-TypeData -TypeName System.Diagnostics.Stopwatch -MemberType ScriptProperty -MemberName Elapsed -Value { [TimeSpan]::FromSeconds($script:ElapsedSeconds) } -Force
+function Start-Sleep {
+    param($Milliseconds)
+    $script:ElapsedSeconds += 120
+    $script:Sleeps++
+}
+function Invoke-TaipReadOnlyRequest {
+    param($Uri,$AccessToken)
+    if ($Uri.EndsWith('/api/health')) {
+        $script:Requests++
+        if ($script:ElapsedSeconds -lt 240) { throw 'Synthetic service is warming up.' }
+        return [pscustomobject]@{status='ok'}
+    }
+    [pscustomobject]@{mode='live'}
+}
+Wait-TaipReadiness -Origin 'https://localhost:8443' -AccessToken ('x'*64) -ExpectedMode 'live'
+@{Requests=$script:Requests;Sleeps=$script:Sleeps;ElapsedSeconds=$script:ElapsedSeconds}
+""")
+        self.assertNotIn("Error", result)
+        self.assertEqual(result, {"Requests": 3, "Sleeps": 2, "ElapsedSeconds": 240})
+
+    def test_default_readiness_deadline_is_five_minutes_with_clean_failure_message(self):
+        result = self.exercise(r"""
+Update-TypeData -TypeName System.Diagnostics.Stopwatch -MemberType ScriptProperty -MemberName Elapsed -Value { [TimeSpan]::FromSeconds(300) } -Force
+function Start-Sleep { throw 'The default readiness deadline must already have elapsed.' }
+function Invoke-TaipReadOnlyRequest { param($Uri,$AccessToken) throw 'Synthetic service remains unavailable.' }
+Wait-TaipReadiness -Origin 'https://localhost:8443' -AccessToken ('x'*64) -ExpectedMode 'live'
+""")
+        self.assertEqual(
+            result["Error"],
+            "The application was not ready in 300 seconds. Check the container diagnostics.",
+        )
 
     def test_explicit_mock_never_reads_a_real_desktop_configuration(self):
         result = self.exercise(r"""

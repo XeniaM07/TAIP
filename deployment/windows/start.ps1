@@ -222,7 +222,7 @@ function Invoke-TaipReadOnlyRequest {
 
 function Wait-TaipReadiness {
     param([string]$Origin, [string]$AccessToken, [string]$ExpectedMode,
-          [int]$TimeoutSeconds = 60, [int]$RetryIntervalMilliseconds = 1000)
+          [int]$TimeoutSeconds = 300, [int]$RetryIntervalMilliseconds = 1000)
     $clock = [Diagnostics.Stopwatch]::StartNew()
     do {
         try {
@@ -233,7 +233,7 @@ function Wait-TaipReadiness {
         if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) { break }
         Start-Sleep -Milliseconds $RetryIntervalMilliseconds
     } while ($true)
-    throw "The application was not ready in $TimeoutSeconds seconds. Check the container diagnostics. No AI generation was requested."
+    throw "The application was not ready in $TimeoutSeconds seconds. Check the container diagnostics."
 }
 
 function Save-TaipLauncherDiagnostics {
