@@ -111,6 +111,7 @@ $last=Get-TaipComposeArguments -RepositoryRoot $env:TAIP_TEST_ROOT -PrivateDirec
         self.assertNotIn("Error", result)
         self.assertTrue(result["Stable"])
         self.assertIn("b" * 64, result["Text"])
+        self.assertRegex(result["Text"], r"(?m)^  gateway:\r?\n    environment:\r?\n      TAIP_LAUNCHER_LOGIN: 'true'$")
         self.assertNotIn("compose.public.ai.yaml", " ".join(result["Args"]))
 
     def test_readiness_uses_only_health_and_runtime_gets(self):
@@ -205,6 +206,7 @@ function Ensure-TaipDocker { param($AllowInstall) [pscustomobject]@{Executable='
 function Ensure-TaipCertificate { param($PrivateDirectory) }
 function Wait-TaipReadiness { param($Origin,$AccessToken,$ExpectedMode) $script:Modes += $ExpectedMode }
 function Open-TaipApplication { param($Origin,$PrivateDirectory) $script:BrowserCalls++ }
+function New-TaipBrowserLaunchCode { param($Origin,$AccessToken) throw 'NoBrowser must never mint a browser code.' }
 function Invoke-TaipDocker {
     param($Docker,$Arguments,$TimeoutSeconds,$WorkingDirectory)
     $script:Calls += ,@($Arguments)
@@ -261,17 +263,20 @@ $second=Get-TaipFreePort -Preferred $first -Exclude $first
 """)
         self.assertNotEqual(result["First"], result["Second"])
 
-    def test_login_window_includes_username_and_address_without_url_credentials(self):
+    def test_browser_handoff_uses_one_use_fragment_without_plaintext_login_window(self):
         self.private.mkdir()
         (self.private / "access-token.txt").write_text("x" * 64, encoding="utf-8")
         result = self.exercise(r"""
 $script:Windows=@()
+$script:MintCalls=@()
+function New-TaipBrowserLaunchCode { param($Origin,$AccessToken) $script:MintCalls += ,@($Origin,$AccessToken); return ('b'*43) }
 function Start-Process { param($FilePath,$ArgumentList,$WindowStyle) $script:Windows += ,@($FilePath,$ArgumentList,$WindowStyle) }
 Open-TaipApplication -Origin 'https://localhost:8443' -PrivateDirectory $env:TAIP_TEST_PRIVATE
-@{Login=[IO.File]::ReadAllText("$env:TAIP_TEST_PRIVATE/login.txt");Windows=$script:Windows}
+@{LoginExists=(Test-Path -LiteralPath "$env:TAIP_TEST_PRIVATE/login.txt");Windows=$script:Windows;MintCalls=$script:MintCalls}
 """)
         self.assertNotIn("Error", result)
-        self.assertIn("taip", result["Login"])
-        self.assertIn("https://localhost:8443", result["Login"])
-        self.assertIn("x" * 64, result["Login"])
-        self.assertEqual(result["Windows"][-1][0], "https://localhost:8443")
+        self.assertFalse(result["LoginExists"])
+        self.assertEqual(result["MintCalls"], [["https://localhost:8443", "x" * 64]])
+        self.assertEqual(len(result["Windows"]), 1)
+        self.assertEqual(result["Windows"][0][0], "https://localhost:8443/_launcher/#code=" + "b" * 43)
+        self.assertNotIn("x" * 64, result["Windows"][0][0])

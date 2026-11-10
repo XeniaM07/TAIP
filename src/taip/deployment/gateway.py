@@ -1,6 +1,7 @@
 """Stateless authenticated gateway; all mutable workflows stay in one core."""
 
 import asyncio
+import json
 from time import monotonic
 from urllib.parse import unquote, urlsplit
 
@@ -11,8 +12,10 @@ from taip.ai_integration.errors import AIProviderError
 from taip.ai_integration.rate_limits import RateLimitPolicy, RateLimitPort
 from taip.deployment import asgi
 from taip.deployment.auth import CredentialVerifier, origin_is_allowed
+from taip.deployment.browser_sessions import BrowserSessionPort, RedisBrowserSessions, SESSION_TTL_SECONDS, read_browser_cookie
 from taip.deployment.ingress import IngressPort, LocalIngressLimiter, RedisIngressLimiter
-from taip.deployment.settings import DeploymentSettings, load_deployment_settings
+from taip.deployment.launcher_page import launcher_page
+from taip.deployment.settings import DeploymentConfigurationError, DeploymentSettings, load_deployment_settings
 
 
 _KEY = "global-http-admission"
@@ -20,13 +23,25 @@ _REQUEST_HEADERS = {b"accept", b"content-type", b"accept-language"}
 _RESPONSE_HEADERS = {b"content-type", b"content-language", b"content-disposition"}
 
 
+def _browser_response(payload: dict[str, object], *, cookie: str | None = None) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
+    body = json.dumps(payload, separators=(",", ":")).encode("ascii")
+    headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
+               (b"cache-control", b"no-store"), (b"x-content-type-options", b"nosniff"),
+               (b"referrer-policy", b"no-referrer"), (b"x-frame-options", b"DENY")]
+    if cookie is not None:
+        headers.append((b"set-cookie", cookie.encode("ascii")))
+    return 200, headers, body
+
+
 class ProtectedGateway:
     def __init__(self, settings: DeploymentSettings, limiter: RateLimitPort,
-                 client: httpx.AsyncClient, redis_client=None, *, ingress: IngressPort | None = None) -> None:
+                 client: httpx.AsyncClient, redis_client=None, *, ingress: IngressPort | None = None,
+                 browser_sessions: BrowserSessionPort | None = None) -> None:
         self.settings = settings
         self._limiter = limiter
         self._client = client
         self._redis = redis_client
+        self._browser = browser_sessions
         self._closed = False
         self._ingress = ingress if ingress is not None else LocalIngressLimiter(
             requests_per_minute=settings.http_ingress_requests_per_minute)
@@ -66,7 +81,7 @@ class ProtectedGateway:
         except asgi.RequestRejected as error:
             await asgi.send_json(send, error.status_code, error.code,
                                  retry_after_seconds=error.retry_after_seconds,
-                                 challenge="Basic" if error.status_code == 401 else None)
+                                 challenge="Basic" if error.status_code == 401 and not self.settings.launcher_login_enabled else None)
             return
         except Exception:
             await asgi.send_json(send, 503, "gateway_unavailable")
@@ -99,6 +114,54 @@ class ProtectedGateway:
             raise asgi.RequestRejected(400, "invalid_target")
         return raw, query
 
+    async def _browser_public(self, scope: Scope, receive: Receive, *, scheme: str) -> tuple | None:
+        """Handle only the reserved local handoff routes, never proxy them."""
+        path = scope["path"]
+        if path != "/_launcher" and not path.startswith("/_launcher/"):
+            return None
+        if not self.settings.launcher_login_enabled:
+            raise asgi.RequestRejected(404, "not_found")
+        if scheme != "https":
+            raise asgi.RequestRejected(403, "origin_not_allowed")
+        if scope.get("query_string") or scope.get("raw_path", path.encode()) != path.encode():
+            raise asgi.RequestRejected(400, "invalid_request")
+        expected_method = {"/_launcher/": "GET", "/_launcher/code": "POST", "/_launcher/session": "POST"}.get(path)
+        if expected_method is None:
+            raise asgi.RequestRejected(404, "not_found")
+        if scope["method"] != expected_method:
+            raise asgi.RequestRejected(405, "method_not_allowed")
+        if path == "/_launcher/":
+            return launcher_page()
+        if path == "/_launcher/code":
+            return None  # Continue through explicit Bearer authentication and quota.
+        headers = scope.get("headers", ())
+        if not origin_is_allowed("POST", headers, scheme=scheme, expected_origin=self.settings.public_origin,
+                                 authentication_kind="cookie"):
+            raise asgi.RequestRejected(403, "origin_not_allowed")
+        content_types = [v.lower() for k, v in headers if k.lower() == b"content-type"]
+        if len(content_types) != 1 or content_types[0].split(b";", 1)[0].strip() != b"application/json":
+            raise asgi.RequestRejected(415, "unsupported_media_type")
+        body = await asgi.read_body(scope, receive, max_bytes=256, timeout_seconds=min(5, self.settings.body_timeout_seconds))
+        payload = asgi.validate_json_payload(body, 256)
+        if type(payload) is not dict or set(payload) != {"code"} or type(payload["code"]) is not str:
+            raise asgi.RequestRejected(400, "invalid_request")
+        token = await asyncio.to_thread(self._browser.exchange, payload["code"])
+        if token is None:
+            raise asgi.RequestRejected(401, "invalid_launch_code")
+        cookie = f"{self._browser.cookie_name}={token}; Path=/; Max-Age={SESSION_TTL_SECONDS}; Secure; HttpOnly; SameSite=Strict"
+        return _browser_response({"ok": True}, cookie=cookie)
+
+    async def _authenticate(self, headers) -> str:
+        if any(k.lower() == b"authorization" for k, _ in headers):
+            kind = self._auth.authenticate(headers)
+            if kind is not None:
+                return kind
+        elif self.settings.launcher_login_enabled:
+            token = read_browser_cookie(headers, self._browser.cookie_name)
+            if token is not None and await asyncio.to_thread(self._browser.authenticate, token):
+                return "cookie"
+        raise asgi.RequestRejected(401, "authentication_required")
+
     async def _handle(self, scope: Scope, receive: Receive) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
         if self._closed:
             raise asgi.RequestRejected(503, "gateway_unavailable")
@@ -125,11 +188,20 @@ class ProtectedGateway:
                 return 200, [(b"content-type", b"application/json")], b'{"status":"ok"}'
             raw, query = self._validate_target(scope)
             headers = scope.get("headers", ())
-            if self._auth.authenticate(headers) is None:
-                raise asgi.RequestRejected(401, "authentication_required")
             scheme = "https" if self.settings.trust_tls_proxy else scope.get("scheme", "")
+            browser_result = await self._browser_public(scope, receive, scheme=scheme)
+            if browser_result is not None:
+                return browser_result
+            mint = scope["path"] == "/_launcher/code"
+            if mint:
+                if self._auth.authenticate(headers) != "bearer":
+                    raise asgi.RequestRejected(401, "authentication_required")
+                kind = "bearer"
+            else:
+                kind = await self._authenticate(headers)
             if not origin_is_allowed(scope["method"], headers, scheme=scheme,
-                                     expected_origin=self.settings.public_origin):
+                                     expected_origin=self.settings.public_origin,
+                                     authentication_kind="cookie" if kind == "cookie" else None):
                 raise asgi.RequestRejected(403, "origin_not_allowed")
             try:
                 permit = await asyncio.to_thread(self._limiter.acquire, _KEY, policy=self._policy,
@@ -138,8 +210,10 @@ class ProtectedGateway:
                 raise asgi.RequestRejected(429 if error.code == "local_rate_limit" else 503,
                                            error.code, error.retry_after_seconds) from None
         try:
-            body = await asgi.read_body(scope, receive, max_bytes=self.settings.max_body_bytes,
+            body = await asgi.read_body(scope, receive, max_bytes=0 if mint else self.settings.max_body_bytes,
                                         timeout_seconds=self.settings.body_timeout_seconds)
+            if mint:
+                return _browser_response({"code": await asyncio.to_thread(self._browser.mint)})
             core = scope["path"] == "/api" or scope["path"].startswith("/api/")
             url = httpx.URL(self.settings.core_url if core else self.settings.web_url).copy_with(
                 raw_path=raw + (b"?" + query if query else b""))
@@ -204,7 +278,7 @@ class ProtectedGateway:
 
 def create_gateway_app(settings: DeploymentSettings | None = None, *, limiter: RateLimitPort | None = None,
                        transport: httpx.AsyncBaseTransport | None = None, redis_client=None,
-                       ingress: IngressPort | None = None) -> ProtectedGateway:
+                       ingress: IngressPort | None = None, browser_sessions: BrowserSessionPort | None = None) -> ProtectedGateway:
     settings = load_deployment_settings() if settings is None else settings
     owned_client = None
     if limiter is None:
@@ -214,10 +288,20 @@ def create_gateway_app(settings: DeploymentSettings | None = None, *, limiter: R
         limiter = RedisRateLimiter(redis_client if redis_client is not None else owned_client,
                                    namespace=settings.redis.namespace + ":http", lease_seconds=settings.redis_lease_seconds)
     ingress_client = redis_client if redis_client is not None else owned_client
+    if settings.launcher_login_enabled and browser_sessions is None:
+        if ingress_client is None:
+            raise DeploymentConfigurationError("launcher_login_enabled")
+        try:
+            browser_sessions = RedisBrowserSessions(ingress_client, namespace=settings.redis.namespace,
+                public_origin=settings.public_origin, access_token_digest=settings.access_token_digest)
+        except Exception:
+            if owned_client is not None:
+                owned_client.close()
+            raise
     if ingress is None and ingress_client is not None:
         ingress = RedisIngressLimiter(ingress_client, namespace=settings.redis.namespace,
                                        requests_per_minute=settings.http_ingress_requests_per_minute)
     client = httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False,
                                timeout=settings.request_timeout_seconds,
                                limits=httpx.Limits(max_connections=settings.http_max_concurrent, max_keepalive_connections=16))
-    return ProtectedGateway(settings, limiter, client, owned_client, ingress=ingress)
+    return ProtectedGateway(settings, limiter, client, owned_client, ingress=ingress, browser_sessions=browser_sessions)

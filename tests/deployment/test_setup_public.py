@@ -96,7 +96,7 @@ class PublicSetupTests(unittest.TestCase):
         allowed = {word[1:].upper() for word in acl.split() if word.startswith("+")}
         deployment = Path(self.module.__file__).parent
         required = set()
-        for name in ("quota.lua", "ownership.py", "ingress.py"):
+        for name in ("quota.lua", "ownership.py", "ingress.py", "browser_sessions.py"):
             source = (deployment / name).read_text(encoding="utf-8")
             arguments = re.findall(r"\bredis\.(?:call|pcall)\s*\(\s*([^,\n)]+)", source)
             self.assertTrue(arguments, f"{name} must expose the Lua command sites to this contract")

@@ -37,6 +37,9 @@ jobs:
           tests.deployment.test_launcher_setup
           tests.deployment.test_launcher_diagnostics
           tests.deployment.test_launcher_certificate
+          tests.deployment.test_launcher_browser_login
+          tests.deployment.test_browser_sessions
+          tests.deployment.test_browser_login
   offline-and-real-redis:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -96,6 +99,11 @@ jobs:
           docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml exec -T core python -c 'import os,pathlib; commands=[p.read_bytes() for p in pathlib.Path("/proc").glob("[0-9]*/cmdline") if p.parent.name != str(os.getpid())]; python_commands=[c for c in commands if c.split(b"\0",1)[0].rsplit(b"/",1)[-1].startswith(b"python")]; assert sum(b"uvicorn" in c and b"taip.deployment.core:create_core_app" in c for c in python_commands) == 1; assert not any(b"multiprocessing.spawn" in c and b"spawn_main" in c for c in commands)'
       - name: Exercise HTTPS authentication and the existing mock workflow
         run: uv run --no-sync python -m tests.deployment.smoke_public --directory "$RUNNER_TEMP/taip-public"
+      - name: Exercise automatic browser authentication against both gateway workers
+        run: |
+          python -c 'import os,pathlib; (pathlib.Path(os.environ["RUNNER_TEMP"])/"taip-public/browser-login.yaml").write_text("services:\n  gateway:\n    environment:\n      TAIP_LAUNCHER_LOGIN: \"true\"\n")'
+          docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml -f "$RUNNER_TEMP/taip-public/browser-login.yaml" up -d --no-deps --wait --wait-timeout 180 gateway
+          uv run --no-sync python -m tests.deployment.smoke_public --directory "$RUNNER_TEMP/taip-public" --browser-login-only
       - name: Verify Redis outage fails closed
         run: |
           docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml stop redis

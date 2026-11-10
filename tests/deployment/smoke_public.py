@@ -9,6 +9,7 @@ import argparse
 from pathlib import Path
 import ipaddress
 import re
+import ssl
 import sys
 import time
 from urllib.parse import urlsplit
@@ -20,6 +21,42 @@ from taip.application.workflow import MOCK_DEMO_PROMPT, MOCK_MODEL_IDS
 
 class SmokeFailure(RuntimeError):
     """A diagnostic containing only route names and HTTP statuses."""
+
+
+def _tls_context(directory: Path) -> ssl.SSLContext:
+    return ssl.create_default_context(cafile=str(directory / "caddy-data/caddy/pki/authorities/local/root.crt"))
+
+
+def run_browser_login_smoke(directory: Path, origin: str) -> None:
+    """Exercise only local authentication, never workflow generation."""
+    origin = _loopback_origin(origin)
+    token = (directory / "access-token.txt").read_text(encoding="utf-8").strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{64}", token) is None:
+        raise ValueError("smoke setup must contain a freshly generated test token")
+    with httpx.Client(base_url=origin, verify=_tls_context(directory), trust_env=False,
+                      follow_redirects=False, timeout=15) as client:
+        anonymous = _expect(client.get("/api/health"), 401, "anonymous cookie deployment")
+        if "www-authenticate" in anonymous.headers:
+            raise SmokeFailure("launcher deployment unexpectedly requested a manual password")
+        _expect(client.get("/_launcher/"), 200, "launcher handoff page")
+        minted = _expect(client.post("/_launcher/code", headers={"Authorization": "Bearer " + token}),
+                         200, "launcher code mint")
+        code = minted.json().get("code")
+        if not isinstance(code, str) or re.fullmatch(r"[A-Za-z0-9_-]{43}", code) is None:
+            raise SmokeFailure("launcher returned an invalid code")
+        _expect(client.post("/_launcher/session", headers={"Origin": origin}, json={"code": code}),
+                200, "launcher cookie exchange")
+        _expect(client.get("/"), 200, "cookie frontend")
+        for _ in range(6):
+            _expect(client.get("/api/health"), 200, "cross-worker cookie health")
+        runtime = _expect(client.get("/api/runtime"), 200, "cookie runtime")
+        if runtime.json().get("mode") != "mock":
+            raise SmokeFailure("CI authentication smoke must use mock configuration")
+        _expect(client.post("/_launcher/session", headers={"Origin": origin}, json={"code": code}),
+                401, "replayed launcher code")
+        _expect(client.post("/api/sessions", json={}), 403, "cookie mutation without Origin")
+        _expect(client.post("/_launcher/code"), 401, "cookie cannot mint another code")
+    print("PASS: TLS-verified launcher code exchange, shared cookie login, replay and Origin enforcement.")
 
 
 def _loopback_origin(value: str) -> str:
@@ -50,8 +87,7 @@ def run_smoke(directory: Path, origin: str, *, http_port: int, redis_unavailable
     if re.fullmatch(r"[A-Za-z0-9_-]{64}", token) is None:
         raise ValueError("smoke setup must contain a freshly generated test token")
     bearer = {"Authorization": "Bearer " + token}
-    # localhost uses an ephemeral Caddy local CA; this exemption is test-only.
-    with httpx.Client(base_url=origin, verify=False, trust_env=False, timeout=15,
+    with httpx.Client(base_url=origin, verify=_tls_context(directory), trust_env=False, timeout=15,
                       follow_redirects=False) as client:
         if redis_unavailable:
             _expect(client.get("/api/health", headers=bearer), 503, "Redis outage")
@@ -110,10 +146,14 @@ def main() -> int:
     parser.add_argument("--origin", default="https://localhost:8443")
     parser.add_argument("--http-port", type=int, default=8080)
     parser.add_argument("--expect-redis-unavailable", action="store_true")
+    parser.add_argument("--browser-login-only", action="store_true")
     arguments = parser.parse_args()
     try:
-        run_smoke(arguments.directory, arguments.origin, http_port=arguments.http_port,
-                  redis_unavailable=arguments.expect_redis_unavailable)
+        if arguments.browser_login_only:
+            run_browser_login_smoke(arguments.directory, arguments.origin)
+        else:
+            run_smoke(arguments.directory, arguments.origin, http_port=arguments.http_port,
+                      redis_unavailable=arguments.expect_redis_unavailable)
     except (SmokeFailure, OSError, ValueError, KeyError, httpx.HTTPError) as error:
         print(f"Public deployment smoke failed: {error}", file=sys.stderr)
         return 1

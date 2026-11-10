@@ -132,7 +132,7 @@ function Get-TaipComposeArguments {
         throw 'The launcher configuration fingerprint is invalid.'
     }
     $overlay = Join-Path $PrivateDirectory 'launcher.compose.yaml'
-    $content = "services:`n  core:`n    labels:`n      org.taip.launcher.configuration: '$($Configuration.Fingerprint)'`n"
+    $content = "services:`n  core:`n    labels:`n      org.taip.launcher.configuration: '$($Configuration.Fingerprint)'`n  gateway:`n    environment:`n      TAIP_LAUNCHER_LOGIN: 'true'`n"
     Write-TaipPrivateTextIfChanged -Path $overlay -Text $content
     $arguments = @('compose', '--project-directory', $RepositoryRoot, '-p', (Get-TaipProjectName $PrivateDirectory),
         '--env-file', (Join-Path $PrivateDirectory 'public.env'))
@@ -268,14 +268,79 @@ function Save-TaipLauncherDiagnostics {
     } catch { Write-Host 'Container diagnostics were unavailable.' }
 }
 
+function New-TaipHttpRequest {
+    param([Parameter(Mandatory=$true)][Uri]$Uri)
+    return [Net.HttpWebRequest]::Create($Uri)
+}
+
+function New-TaipBrowserLaunchCode {
+    param([string]$Origin, [string]$AccessToken)
+    $request = $null
+    $response = $null
+    $stream = $null
+    $completed = $false
+    try {
+        $address = $null
+        if ($Origin -notmatch '\Ahttps://localhost(?::[0-9]{1,5})?/?\z' -or
+                -not [Uri]::TryCreate($Origin, [UriKind]::Absolute, [ref]$address) -or
+                $address.Port -lt 1 -or $address.UserInfo -or $address.Query -or $address.Fragment -or
+                $address.AbsolutePath -ne '/' -or $AccessToken -cnotmatch '\A[A-Za-z0-9_-]{64}\z') {
+            throw 'Invalid launcher authentication input.'
+        }
+        $request = New-TaipHttpRequest -Uri ([Uri]($address.GetLeftPart([UriPartial]::Authority) + '/_launcher/code'))
+        $request.Method = 'POST'
+        $request.ContentLength = 0
+        $request.Proxy = $null
+        $request.AllowAutoRedirect = $false
+        $request.Timeout = 10000
+        $request.ReadWriteTimeout = 10000
+        $request.Accept = 'application/json'
+        $request.Headers['Authorization'] = 'Bearer ' + $AccessToken
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $response = $request.GetResponse()
+        if ([int]$response.StatusCode -ne 200 -or $response.ContentLength -gt 4096 -or
+                $response.ContentType -notmatch '\Aapplication/json(?:\s*;|\z)') {
+            throw 'Unexpected launcher authentication response.'
+        }
+        $stream = $response.GetResponseStream()
+        $buffer = New-Object byte[] 4097
+        $count = 0
+        do {
+            $remaining = 10000 - [int]$clock.ElapsedMilliseconds
+            if ($remaining -le 0) { throw 'Launcher authentication response timed out.' }
+            $reading = $stream.ReadAsync($buffer, $count, $buffer.Length - $count)
+            if (-not $reading.Wait($remaining)) { throw 'Launcher authentication response timed out.' }
+            $received = [int]$reading.Result
+            $count += $received
+            if ($count -gt 4096) { throw 'Launcher authentication response is too large.' }
+        } while ($received -gt 0)
+        $encoding = New-Object Text.UTF8Encoding($false, $true)
+        $payload = ConvertFrom-Json -InputObject ($encoding.GetString($buffer, 0, $count))
+        if ($null -eq $payload -or -not $payload.PSObject.Properties['code'] -or
+                $payload.code -isnot [string] -or $payload.code -cnotmatch '\A[A-Za-z0-9_-]{43}\z') {
+            throw 'Invalid launcher authentication code.'
+        }
+        $completed = $true
+        return $payload.code
+    } catch {
+        throw 'Could not create an automatic browser login. Run Start-TAIP.cmd again.'
+    } finally {
+        if (-not $completed -and $request) { try { $request.Abort() } catch { } }
+        if ($stream) { try { $stream.Dispose() } catch { } }
+        if ($response) { try { $response.Dispose() } catch { } }
+    }
+}
+
 function Open-TaipApplication {
     param([string]$Origin, [string]$PrivateDirectory)
-    $password = [IO.File]::ReadAllText((Join-Path $PrivateDirectory 'access-token.txt')).Trim()
-    $loginPath = Join-Path $PrivateDirectory 'login.txt'
-    $login = "TAIP`r`nAddress: $Origin`r`nUsername: taip`r`nApplication password: $password`r`n`r`nThis is the application login, not a provider API key.`r`n"
-    Write-TaipPrivateTextIfChanged -Path $loginPath -Text $login
-    Start-Process -FilePath 'notepad.exe' -ArgumentList (ConvertTo-TaipWindowsArgument $loginPath) -WindowStyle Normal | Out-Null
-    Start-Process -FilePath $Origin -WindowStyle Normal | Out-Null
+    try {
+        $token = [IO.File]::ReadAllText((Join-Path $PrivateDirectory 'access-token.txt')).Trim()
+        $code = New-TaipBrowserLaunchCode -Origin $Origin -AccessToken $token
+        $launchOrigin = ([Uri]$Origin).GetLeftPart([UriPartial]::Authority)
+        Start-Process -FilePath ($launchOrigin + '/_launcher/#code=' + $code) -WindowStyle Normal -ErrorAction Stop | Out-Null
+    } catch {
+        throw 'Could not open TAIP in the default browser. Run Start-TAIP.cmd again.'
+    }
 }
 
 function Start-TaipApplication {
@@ -319,8 +384,10 @@ function Start-TaipApplication {
         if ($token -cnotmatch '^[A-Za-z0-9_-]{64}$') { throw 'The saved application access token is invalid.' }
         Wait-TaipReadiness -Origin $origin -AccessToken $token -ExpectedMode $configuration.Mode
         Write-Host ('[6/6] Ready: ' + $origin)
-        Write-Host 'The login details are in the local text window opened for you.'
-        if ($OpenBrowser) { Open-TaipApplication -Origin $origin -PrivateDirectory $PrivateDirectory }
+        if ($OpenBrowser) {
+            Write-Host 'Opening TAIP in your default browser...'
+            Open-TaipApplication -Origin $origin -PrivateDirectory $PrivateDirectory
+        }
         return [pscustomobject]@{Origin=$origin;Mode=$configuration.Mode;PrivateDirectory=$PrivateDirectory;ProjectName=(Get-TaipProjectName $PrivateDirectory)}
     } catch {
         if ($docker -and $compose) { Save-TaipLauncherDiagnostics -Docker $docker -ComposeArguments $compose -PrivateDirectory $PrivateDirectory -Configuration $configuration -AdditionalOutput $additionalOutput }

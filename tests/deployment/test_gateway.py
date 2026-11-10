@@ -25,6 +25,19 @@ def settings(**changes):
 
 
 class GatewayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_launcher_login_cannot_silently_fall_back_to_worker_local_state(self):
+        from taip.deployment.gateway import create_gateway_app
+        from taip.deployment.settings import DeploymentConfigurationError
+        config = replace(settings(), public_origin="https://localhost:8443", launcher_login_enabled=True)
+        try:
+            app = create_gateway_app(config, limiter=RateLimiter(),
+                transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+        except DeploymentConfigurationError as error:
+            self.assertEqual(error.field, "launcher_login_enabled")
+        else:
+            await app.aclose()
+            self.fail("Launcher login must require shared session storage when enabled.")
+
     async def client(self, handler, *, limiter=None, config=None, ingress=None):
         from taip.deployment.gateway import create_gateway_app
         options = {} if ingress is None else {"ingress": ingress}
