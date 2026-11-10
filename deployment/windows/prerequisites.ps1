@@ -7,6 +7,9 @@ function Get-TaipDockerEnvironment {
         DOCKER_TLS_VERIFY=$null; DOCKER_CERT_PATH=$null
         COMPOSE_FILE=$null; COMPOSE_PROJECT_NAME=$null; COMPOSE_PROFILES=$null
         COMPOSE_ENV_FILES=$null; COMPOSE_PATH_SEPARATOR=$null
+        # Cached BuildKit provenance can change an image index despite unchanged
+        # sources, making Compose recreate containers and lose active sessions.
+        BUILDX_NO_DEFAULT_ATTESTATIONS='1'
     }
     # Enumerate names only. Never copy inherited provider keys into generated state
     # or mutate the user's environment; explicit launcher env files own this child.

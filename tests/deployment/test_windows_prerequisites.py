@@ -113,6 +113,17 @@ class WindowsPrerequisiteTests(unittest.TestCase):
         self.assertEqual(result["ParentOrigin"], "https://synthetic-wrong.invalid")
         self.assertTrue(result["ParentKeyPresent"])
 
+    def test_build_provenance_is_disabled_only_in_child_to_preserve_unchanged_containers(self):
+        result = self.run_ps(
+            "$env:BUILDX_NO_DEFAULT_ATTESTATIONS='0'\n"
+            "$code = 'import os; print(os.environ.get(\"BUILDX_NO_DEFAULT_ATTESTATIONS\", \"missing\"))'\n"
+            f"$child = Invoke-TaipProcess -FilePath {literal(sys.executable)} -Arguments @('-c',$code) -TimeoutSeconds 5 -Environment (Get-TaipDockerEnvironment)\n"
+            "@{Child=$child.StdOut.Trim(); Parent=$env:BUILDX_NO_DEFAULT_ATTESTATIONS} | ConvertTo-Json -Compress",
+            prerequisites=True,
+        )
+        self.assertEqual(result["Child"], "1")
+        self.assertEqual(result["Parent"], "0")
+
     def test_existing_linux_desktop_is_reused_without_starting_or_installing(self):
         result = self.run_docker_scenario("ready")
         self.assertEqual(result["Docker"], {"Executable": "docker.exe", "Context": "desktop-linux"})

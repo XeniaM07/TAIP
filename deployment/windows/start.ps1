@@ -154,13 +154,26 @@ function Ensure-TaipCertificate {
     $certificate = New-Object Security.Cryptography.X509Certificates.X509Certificate2($path)
     try {
         $ca = @($certificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.19' })
-        if ($ca.Count -ne 1 -or -not $ca[0].CertificateAuthority -or $certificate.Subject -ne $certificate.Issuer -or $certificate.NotAfter -le (Get-Date)) {
+        $now = Get-Date
+        if ($ca.Count -ne 1 -or -not $ca[0].CertificateAuthority -or $certificate.Subject -ne $certificate.Issuer -or $certificate.NotBefore -gt $now -or $certificate.NotAfter -le $now) {
             throw 'The generated local HTTPS certificate is invalid.'
         }
         $storePath = 'Cert:\CurrentUser\Root\' + $certificate.Thumbprint
         if (-not (Test-Path -LiteralPath $storePath)) {
             Write-Host 'Trusting this local Caddy certificate for the current Windows user...'
-            Import-Certificate -FilePath $path -CertStoreLocation 'Cert:\CurrentUser\Root' -ErrorAction Stop | Out-Null
+            try {
+                $import = Invoke-TaipProcess -FilePath (Join-Path $env:SystemRoot 'System32\certutil.exe') -Arguments @('-user', '-addstore', 'Root', $path) -TimeoutSeconds 30
+            } catch {
+                throw 'Could not update the current Windows user certificate trust store. The certificate import did not finish successfully. Check Windows certificate permissions and retry.'
+            }
+            if ($import.ExitCode -ne 0) {
+                $detail = ($import.StdErr + "`n" + $import.StdOut).Trim()
+                if ($detail.Length -gt 1200) { $detail = $detail.Substring($detail.Length - 1200) }
+                throw "Could not trust the local HTTPS certificate for the current Windows user (certutil exit code $($import.ExitCode)). Check Windows certificate store permissions. $detail"
+            }
+            if (-not (Test-Path -LiteralPath $storePath)) {
+                throw 'The exact local HTTPS certificate is missing from the current Windows user trust store after import. Check Windows certificate permissions and retry.'
+            }
         }
     } finally { $certificate.Dispose() }
 }
@@ -211,18 +224,33 @@ function Wait-TaipReadiness {
 }
 
 function Save-TaipLauncherDiagnostics {
-    param($Docker, [string[]]$ComposeArguments, [string]$PrivateDirectory, $Configuration)
+    param($Docker, [string[]]$ComposeArguments, [string]$PrivateDirectory, $Configuration,
+          [string]$AdditionalOutput = '')
     try {
-        $logs = Invoke-TaipDocker -Docker $Docker -Arguments ($ComposeArguments + @('logs', '--no-color', '--tail', '40', 'core', 'gateway', 'redis', 'web', 'caddy')) -TimeoutSeconds 30
-        $text = $logs.StdErr + "`n" + $logs.StdOut
+        $text = $AdditionalOutput
+        try {
+            $logs = Invoke-TaipDocker -Docker $Docker -Arguments ($ComposeArguments + @('logs', '--no-color', '--tail', '40', 'core', 'gateway', 'redis', 'web', 'caddy')) -TimeoutSeconds 30
+            $text += "`n" + $logs.StdErr + "`n" + $logs.StdOut
+        } catch {
+            # A build can fail before any container exists or the daemon can stop.
+            # Preserve its native output even when runtime logs cannot be obtained.
+            $text += "`nContainer diagnostics were unavailable."
+        }
         if ($Configuration -and $Configuration.Values) {
             foreach ($name in @('GEMINI_API_KEY', 'GROQ_API_KEY', 'OPENROUTER_API_KEY')) {
                 $value = [string]$Configuration.Values[$name]
                 if ($value) { $text = $text.Replace($value, '[redacted]') }
             }
         }
-        if ($text.Length -gt 65536) { $text = $text.Substring($text.Length - 65536) }
-        [IO.File]::WriteAllText((Join-Path $PrivateDirectory 'launcher.log'), $text, (New-Object Text.UTF8Encoding($false)))
+        $encoding = New-Object Text.UTF8Encoding($false)
+        $bytes = $encoding.GetBytes($text)
+        if ($bytes.Length -gt 65536) {
+            $offset = $bytes.Length - 65536
+            # Trim at a UTF-8 boundary so a 64 KiB file remains valid text.
+            while (($bytes[$offset] -band 0xC0) -eq 0x80) { $offset++ }
+            $text = $encoding.GetString($bytes, $offset, $bytes.Length - $offset)
+        }
+        [IO.File]::WriteAllText((Join-Path $PrivateDirectory 'launcher.log'), $text, $encoding)
         Write-Host ('Diagnostics: ' + (Join-Path $PrivateDirectory 'launcher.log'))
     } catch { Write-Host 'Container diagnostics were unavailable.' }
 }
@@ -253,6 +281,7 @@ function Start-TaipApplication {
     $docker = $null
     $compose = $null
     $configuration = $null
+    $additionalOutput = ''
     try {
         try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
         if (-not $owned) { throw 'TAIP is already starting. Use the existing launcher window.' }
@@ -268,6 +297,7 @@ function Start-TaipApplication {
         $compose = Get-TaipComposeArguments -RepositoryRoot $RepositoryRoot -PrivateDirectory $PrivateDirectory -Configuration $configuration
         Write-Host '[4/6] Building and starting containers. The first download can take several minutes...'
         $up = Invoke-TaipDocker -Docker $docker -Arguments ($compose + @('up', '--build', '-d', '--wait', '--wait-timeout', '180')) -TimeoutSeconds 1800 -WorkingDirectory $RepositoryRoot
+        $additionalOutput = $up.StdOut + "`n" + $up.StdErr
         if ($up.ExitCode -ne 0) { throw 'Docker could not build or start every service. Check launcher.log for the failing step.' }
         Write-Host '[5/6] Checking local HTTPS and application readiness...'
         Ensure-TaipCertificate -PrivateDirectory $PrivateDirectory
@@ -280,7 +310,7 @@ function Start-TaipApplication {
         if ($OpenBrowser) { Open-TaipApplication -Origin $origin -PrivateDirectory $PrivateDirectory }
         return [pscustomobject]@{Origin=$origin;Mode=$configuration.Mode;PrivateDirectory=$PrivateDirectory;ProjectName=(Get-TaipProjectName $PrivateDirectory)}
     } catch {
-        if ($docker -and $compose) { Save-TaipLauncherDiagnostics -Docker $docker -ComposeArguments $compose -PrivateDirectory $PrivateDirectory -Configuration $configuration }
+        if ($docker -and $compose) { Save-TaipLauncherDiagnostics -Docker $docker -ComposeArguments $compose -PrivateDirectory $PrivateDirectory -Configuration $configuration -AdditionalOutput $additionalOutput }
         throw
     } finally {
         if ($owned) { $mutex.ReleaseMutex() }
