@@ -25,7 +25,7 @@ class PublicSetupTests(unittest.TestCase):
         self.module = import_module("taip.deployment.setup_public")
         self.temporary = TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
         self.directory = self.base / "private deployment"
 
     def test_generates_distinct_credentials_and_a_matching_hash_without_printing_secrets(self):
@@ -96,7 +96,7 @@ class PublicSetupTests(unittest.TestCase):
         allowed = {word[1:].upper() for word in acl.split() if word.startswith("+")}
         deployment = Path(self.module.__file__).parent
         required = set()
-        for name in ("quota.lua", "ownership.py", "ingress.py"):
+        for name in ("quota.lua", "ownership.py", "ingress.py", "browser_sessions.py"):
             source = (deployment / name).read_text(encoding="utf-8")
             arguments = re.findall(r"\bredis\.(?:call|pcall)\s*\(\s*([^,\n)]+)", source)
             self.assertTrue(arguments, f"{name} must expose the Lua command sites to this contract")

@@ -79,12 +79,14 @@ class CredentialVerifier:
 
 def origin_is_allowed(
     method: str, headers: Sequence[tuple[bytes, bytes]], *, scheme: str, expected_origin: str,
+    authentication_kind: str | None = None,
 ) -> bool:
     """Check public TLS and Origin policy after authentication succeeds.
 
 ``scheme`` is the actual transport or the configured origin scheme when a
 private TLS terminator is explicitly trusted. Forwarding headers are ignored.
-Originless browser Basic requests may only navigate with GET/HEAD/OPTIONS;
+The cookie kind is supplied only after the gateway verifies its session.
+Originless browser Basic/cookie requests may only navigate with GET/HEAD/OPTIONS;
 explicit Bearer credentials also support originless command-line mutations.
 """
     if type(method) is not str or method not in ("GET", "HEAD", "OPTIONS", "POST", "PATCH", "PUT", "DELETE"):
@@ -92,8 +94,14 @@ explicit Bearer credentials also support originless command-line mutations.
     if scheme != "https":
         return False
     authorization = _authorization(headers)
+    if authentication_kind == "cookie":
+        credential_scheme = b"cookie"
+    elif authentication_kind is None and authorization is not None:
+        credential_scheme = authorization[0]
+    else:
+        return False
     origins = _headers_named(headers, b"origin")
-    if authorization is None or origins is None or len(origins) > 1:
+    if origins is None or len(origins) > 1:
         return False
     try:
         expected = _normalize_origin(expected_origin)
@@ -104,5 +112,4 @@ explicit Bearer credentials also support originless command-line mutations.
             return hmac.compare_digest(actual, expected)
     except (DeploymentConfigurationError, UnicodeError, ValueError):
         return False
-    credential_scheme, _ = authorization
     return credential_scheme == b"bearer" or method in ("GET", "HEAD", "OPTIONS")

@@ -94,6 +94,27 @@ class DeploymentSettingsTests(unittest.TestCase):
         self.assertIs(settings.live_ai, False)
         self.assertIs(settings.trust_tls_proxy, False)
 
+    def test_launcher_login_is_explicit_and_localhost_only(self):
+        try:
+            config = self.settings(public_origin="https://localhost:8443", launcher_login_enabled=True)
+        except TypeError:
+            self.fail("Settings must support explicitly enabled local launcher login.")
+        self.assertIs(config.launcher_login_enabled, True)
+        self.assertIs(self.settings().launcher_login_enabled, False)
+        for origin in ("https://lab.example.test", "https://127.0.0.1:8443"):
+            with self.subTest(origin=origin), self.assertRaises(self.error):
+                self.settings(public_origin=origin, launcher_login_enabled=True)
+        for invalid in (1, "true", None):
+            with self.subTest(value=invalid), self.assertRaises(self.error):
+                self.settings(public_origin="https://localhost", launcher_login_enabled=invalid)
+
+    def test_environment_can_enable_local_launcher_login_without_changing_credentials(self):
+        config = self.load(TAIP_PUBLIC_ORIGIN="https://localhost:8443", TAIP_LAUNCHER_LOGIN="true")
+        self.assertIs(getattr(config, "launcher_login_enabled", None), True)
+        self.assertEqual(config.access_token_digest, DIGEST)
+        with self.assertRaises(self.error):
+            self.load(TAIP_LAUNCHER_LOGIN="true")
+
     def test_origins_reject_credentials_paths_query_fragments_and_unsafe_schemes(self):
         for value in (
             "http://lab.example.test", "https://user:secret@lab.example.test",

@@ -179,6 +179,7 @@ class DeploymentSettings:
     http_ingress_max_concurrent: int = 8
     live_ai: bool = False
     trust_tls_proxy: bool = False
+    launcher_login_enabled: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "public_origin", _normalize_origin(self.public_origin))
@@ -207,6 +208,9 @@ class DeploymentSettings:
             _fail("redis_lease_seconds")
         _boolean(self.live_ai, "live_ai")
         _boolean(self.trust_tls_proxy, "trust_tls_proxy")
+        _boolean(self.launcher_login_enabled, "launcher_login_enabled")
+        if self.launcher_login_enabled and urlsplit(self.public_origin).hostname != "localhost":
+            _fail("launcher_login_enabled")
         if hmac.compare_digest(self.access_token_digest, hashlib.sha256(self.internal_token.encode("ascii")).digest()):
             _fail("access_token_digest")
         if hmac.compare_digest(self.redis.password, self.internal_token):
@@ -303,4 +307,5 @@ def load_deployment_settings(
         http_ingress_max_concurrent=integer("TAIP_HTTP_INGRESS_MAX_CONCURRENT", "http_ingress_max_concurrent", "8"),
         live_ai=boolean("TAIP_LIVE_AI", "live_ai"),
         trust_tls_proxy=boolean("TAIP_TLS_TERMINATED_BY_PROXY", "trust_tls_proxy"),
+        launcher_login_enabled=boolean("TAIP_LAUNCHER_LOGIN", "launcher_login_enabled"),
     )

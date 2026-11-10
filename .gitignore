@@ -9,6 +9,8 @@ __pycache__/
 
 # Environment variables
 .env
+keys
+keys.txt
 
 # Test cache
 .pytest_cache/

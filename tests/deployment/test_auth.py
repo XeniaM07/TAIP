@@ -164,6 +164,23 @@ class OriginPolicyTests(unittest.TestCase):
         self.assertFalse(self.allowed("POST", [basic(), *forwarded]))
         self.assertFalse(self.allowed("GET", [basic(), *forwarded], scheme="http"))
 
+    def test_cookie_navigation_and_mutations_obey_ambient_origin_policy(self):
+        def allowed(method, headers=(), scheme="https"):
+            try:
+                return self.module.origin_is_allowed(method, headers, scheme=scheme,
+                    expected_origin=ORIGIN, authentication_kind="cookie")
+            except TypeError:
+                self.fail("Origin policy must support authenticated browser cookies.")
+        self.assertTrue(allowed("GET"))
+        self.assertFalse(allowed("GET", scheme="http"))
+        self.assertFalse(allowed("GET", [(b"origin", b"https://attacker.test")]))
+        for method in ("POST", "PATCH", "PUT", "DELETE"):
+            with self.subTest(method=method):
+                self.assertFalse(allowed(method))
+                self.assertTrue(allowed(method, [(b"origin", ORIGIN.encode())]))
+                for origin in (b"null", b"https://attacker.test"):
+                    self.assertFalse(allowed(method, [(b"origin", origin)]))
+
     def test_bad_inputs_return_false_without_exceptions(self):
         for headers in ([None], [(b"origin", "https://lab.example.test")], [bearer(), bearer()]):
             with self.subTest(kind=type(headers)):

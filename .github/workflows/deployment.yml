@@ -14,6 +14,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-launcher-contracts:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Install locked test dependencies
+        run: uv sync --all-extras --locked
+      - name: Exercise Windows launcher without installers or vendor calls
+        run: >-
+          uv run --no-sync python -m unittest
+          tests.deployment.test_windows_keys
+          tests.deployment.test_windows_prerequisites
+          tests.deployment.test_windows_launcher
+          tests.deployment.test_launcher_setup
+          tests.deployment.test_launcher_diagnostics
+          tests.deployment.test_launcher_certificate
+          tests.deployment.test_launcher_browser_login
+          tests.deployment.test_browser_sessions
+          tests.deployment.test_browser_login
   offline-and-real-redis:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -43,7 +69,9 @@ jobs:
         run: uv run --no-sync python -m unittest discover -s tests -t .
       - name: Prepare ephemeral private deployment configuration
         id: bootstrap
-        run: uv run --no-sync python -m taip.deployment.setup_public --directory "$RUNNER_TEMP/taip-public"
+        run: |
+          mkdir -p "$RUNNER_TEMP/taip-public"
+          docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true --user "$(id -u):$(id -g)" -v "$PWD:/taip-source:ro" -v "$RUNNER_TEMP/taip-public:/taip-private" python:3.12-slim python /taip-source/src/taip/deployment/setup_public.py --directory /taip-private --environment-directory "$RUNNER_TEMP/taip-public" --reuse-existing
       - name: Validate standalone Compose configuration
         run: |
           docker compose --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml config --format json > "$RUNNER_TEMP/taip-public/compose.json"
@@ -71,6 +99,11 @@ jobs:
           docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml exec -T core python -c 'import os,pathlib; commands=[p.read_bytes() for p in pathlib.Path("/proc").glob("[0-9]*/cmdline") if p.parent.name != str(os.getpid())]; python_commands=[c for c in commands if c.split(b"\0",1)[0].rsplit(b"/",1)[-1].startswith(b"python")]; assert sum(b"uvicorn" in c and b"taip.deployment.core:create_core_app" in c for c in python_commands) == 1; assert not any(b"multiprocessing.spawn" in c and b"spawn_main" in c for c in commands)'
       - name: Exercise HTTPS authentication and the existing mock workflow
         run: uv run --no-sync python -m tests.deployment.smoke_public --directory "$RUNNER_TEMP/taip-public"
+      - name: Exercise automatic browser authentication against both gateway workers
+        run: |
+          python -c 'import os,pathlib; (pathlib.Path(os.environ["RUNNER_TEMP"])/"taip-public/browser-login.yaml").write_text("services:\n  gateway:\n    environment:\n      TAIP_LAUNCHER_LOGIN: \"true\"\n")'
+          docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml -f "$RUNNER_TEMP/taip-public/browser-login.yaml" up -d --no-deps --wait --wait-timeout 180 gateway
+          uv run --no-sync python -m tests.deployment.smoke_public --directory "$RUNNER_TEMP/taip-public" --browser-login-only
       - name: Verify Redis outage fails closed
         run: |
           docker compose -p taip-public-contract --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml stop redis
