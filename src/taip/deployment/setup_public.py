@@ -259,7 +259,10 @@ def prepare_deployment(
             raise FileExistsError(f"refusing to overwrite an existing deployment path: {path}")
 
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if os.name == "posix":
+    # Docker Desktop exposes Windows ACL-managed bind roots with synthetic
+    # POSIX ownership. The container user may write there yet cannot chmod it.
+    windows_host_mount = environment_directory is not None and isinstance(environment_root, PureWindowsPath)
+    if os.name == "posix" and not windows_host_mount:
         directory.chmod(0o700)
     for name in _PRIVATE_DIRECTORIES:
         (directory / name).mkdir(mode=0o700)

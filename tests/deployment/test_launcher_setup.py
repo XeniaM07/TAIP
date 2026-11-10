@@ -1,11 +1,15 @@
 """Host-path rendering and safe bootstrap reuse, using synthetic private files."""
 
 from pathlib import Path
+import os
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
+from taip.deployment import setup_public
 from taip.deployment.setup_public import prepare_deployment
 
 
@@ -13,7 +17,7 @@ class LauncherSetupTests(unittest.TestCase):
     def setUp(self):
         self.temporary = TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.directory = Path(self.temporary.name) / "container private"
+        self.directory = Path(self.temporary.name).resolve() / "container private"
 
     def snapshot(self):
         return {
@@ -31,6 +35,30 @@ class LauncherSetupTests(unittest.TestCase):
             config.read_text(encoding="utf-8"),
         )
         self.assertTrue((self.directory / "internal-token.txt").is_file())
+
+    def test_windows_host_mount_does_not_require_posix_root_chmod(self):
+        self.directory.mkdir()
+        container_os = SimpleNamespace(**vars(os))
+        container_os.name = "posix"
+        with patch.object(setup_public, "os", container_os), patch.object(
+            type(self.directory), "chmod", side_effect=PermissionError("host mount denies chmod"),
+        ):
+            config = prepare_deployment(self.directory, environment_directory="C:/Private/launcher")
+            before = self.snapshot()
+            prepare_deployment(self.directory, environment_directory="C:/Private/launcher", reuse_existing=True)
+        self.assertTrue(config.is_file())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_posix_host_directory_still_requires_private_root_permissions(self):
+        self.directory.mkdir()
+        container_os = SimpleNamespace(**vars(os))
+        container_os.name = "posix"
+        with patch.object(setup_public, "os", container_os), patch.object(
+            type(self.directory), "chmod", side_effect=PermissionError("host mount denies chmod"),
+        ):
+            with self.assertRaises(PermissionError):
+                prepare_deployment(self.directory, environment_directory="/operator/private")
+        self.assertEqual(list(self.directory.iterdir()), [])
 
     def test_reuse_without_existing_state_creates_complete_deployment(self):
         config = prepare_deployment(self.directory, reuse_existing=True)

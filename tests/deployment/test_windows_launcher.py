@@ -20,7 +20,7 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertTrue(SCRIPT.is_file(), "The one-click orchestration script must exist")
         self.temporary = TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
         self.private = self.base / "private state ' space"
         self.desktop = self.base / "Desktop"
         self.desktop.mkdir()

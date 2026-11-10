@@ -25,7 +25,7 @@ class PublicSetupTests(unittest.TestCase):
         self.module = import_module("taip.deployment.setup_public")
         self.temporary = TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
         self.directory = self.base / "private deployment"
 
     def test_generates_distinct_credentials_and_a_matching_hash_without_printing_secrets(self):

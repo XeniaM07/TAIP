@@ -38,7 +38,7 @@ class WindowsKeyTests(unittest.TestCase):
         self.assertTrue(MODULE.is_file(), "The Windows key module must exist")
         self.temporary = TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
         self.desktop = self.base / "OneDrive desktop space ' unicode-\u0219"
         self.desktop.mkdir()
         self.private = self.base / "private space ' unicode-\u0219 $literal"
