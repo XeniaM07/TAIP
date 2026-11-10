@@ -14,6 +14,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-launcher-contracts:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Install locked test dependencies
+        run: uv sync --all-extras --locked
+      - name: Exercise Windows launcher without installers or vendor calls
+        run: >-
+          uv run --no-sync python -m unittest
+          tests.deployment.test_windows_keys
+          tests.deployment.test_windows_prerequisites
+          tests.deployment.test_windows_launcher
+          tests.deployment.test_launcher_setup
   offline-and-real-redis:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -43,7 +64,9 @@ jobs:
         run: uv run --no-sync python -m unittest discover -s tests -t .
       - name: Prepare ephemeral private deployment configuration
         id: bootstrap
-        run: uv run --no-sync python -m taip.deployment.setup_public --directory "$RUNNER_TEMP/taip-public"
+        run: |
+          mkdir -p "$RUNNER_TEMP/taip-public"
+          docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true --user "$(id -u):$(id -g)" -v "$PWD:/taip-source:ro" -v "$RUNNER_TEMP/taip-public:/taip-private" python:3.12-slim python /taip-source/src/taip/deployment/setup_public.py --directory /taip-private --environment-directory "$RUNNER_TEMP/taip-public" --reuse-existing
       - name: Validate standalone Compose configuration
         run: |
           docker compose --env-file "$RUNNER_TEMP/taip-public/public.env" -f compose.public.yaml config --format json > "$RUNNER_TEMP/taip-public/compose.json"
